@@ -2,7 +2,7 @@
 
 An on-device search engine for everything you need to remember. Index your markdown notes, meeting transcripts, documentation, and knowledge bases. Search with keywords or natural language. Ideal for your agentic flows.
 
-QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.
+QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking. Embeddings use an external OpenAI-compatible API by default; local GGUF embedding models are optional.
 
 ```mermaid
 flowchart LR
@@ -551,26 +551,32 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
   brew install sqlite
   ```
 
-### GGUF Models (via node-llama-cpp)
+### Models
 
-QMD uses three local GGUF models (auto-downloaded on first use):
+QMD uses `text-embedding-3-small` through an OpenAI-compatible `/embeddings` API for vector embeddings by default. Configure it with:
+
+```sh
+export QMD_EMBED_API_KEY="..."
+# Optional for non-OpenAI-compatible gateways:
+export QMD_EMBED_API_BASE_URL="https://api.openai.com/v1"
+export QMD_EMBED_MODEL="text-embedding-3-small"
+```
+
+Reranking and query expansion still use local GGUF models via node-llama-cpp:
 
 | Model | Purpose | Size |
 |-------|---------|------|
-| `embeddinggemma-300M-Q8_0` | Vector embeddings (default) | ~300MB |
 | `qwen3-reranker-0.6b-q8_0` | Re-ranking | ~640MB |
 | `qmd-query-expansion-1.7B-q4_k_m` | Query expansion (fine-tuned) | ~1.1GB |
 
 Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
 
-### Custom Embedding Model
+### Local Embedding Model
 
-Override the default embedding model via the `QMD_EMBED_MODEL` environment variable.
-This is useful for multilingual corpora (e.g. Chinese, Japanese, Korean) where
-`embeddinggemma-300M` has limited coverage.
+Set `QMD_EMBED_MODEL` to an `hf:` URI or `.gguf` path to opt into local node-llama-cpp embeddings.
 
 ```sh
-# Use Qwen3-Embedding-0.6B for better multilingual (CJK) support
+# Use Qwen3-Embedding-0.6B locally
 export QMD_EMBED_MODEL="hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf"
 
 # After changing the model, re-embed all collections:
@@ -578,7 +584,8 @@ qmd embed -f
 ```
 
 Supported model families:
-- **embeddinggemma** (default) — English-optimized, small footprint
+- **OpenAI-compatible embedding APIs** — default path
+- **embeddinggemma** — optional local model, English-optimized, small footprint
 - **Qwen3-Embedding** — Multilingual (119 languages including CJK), MTEB top-ranked
 
 > **Note:** When switching embedding models, you must re-index with `qmd embed -f`
@@ -1173,8 +1180,8 @@ Collection ──► Glob Pattern ──► Markdown Files ──► Parse Title
 Documents are chunked into ~900-token pieces with 15% overlap using smart boundary detection:
 
 ```
-Document ──► Smart Chunk (~900 tokens) ──► Format each chunk ──► node-llama-cpp ──► Store Vectors
-                │                           "title | text"        embedBatch()
+Document ──► Smart Chunk (~900 tokens) ──► Format each chunk ──► Embedding API ──► Store Vectors
+                │                           "title | text"        /embeddings
                 │
                 └─► Chunks stored with:
                     - hash: document hash
@@ -1266,17 +1273,22 @@ Query ──► LLM Expansion ──► [Original, Variant 1, Variant 2]
 
 ## Model Configuration
 
-The default models are defined in `src/llm.ts` as HuggingFace URIs:
+Models are configured in `src/llm.ts`:
 
 ```typescript
-const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+const DEFAULT_EMBED_MODEL = "text-embedding-3-small";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 ```
 
-Override them per-role without touching source via the `models:` block in
-`index.yml` (see [Configuring `index.yml`](#configuring-indexyml)) or the
-`QMD_EMBED_MODEL` env var. Re-run `qmd embed` after changing the embedding model.
+YAML configuration can override those defaults; see `example-index.yml` for a complete config file:
+
+```yaml
+models:
+  embed: text-embedding-3-small
+  rerank: hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf
+  generate: hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf
+```
 
 ### EmbeddingGemma Prompt Format
 

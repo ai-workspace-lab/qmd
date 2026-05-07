@@ -14,21 +14,17 @@
 # your whole knowledge base. Set via: qmd context add / "..."
 global_context: "If you see a relevant [[WikiWord]], you can search for that WikiWord to get more context."
 
-# ─── Terminal hyperlinks (optional) ──────────────────────────────────────────
-# Template that turns result paths into clickable editor links.
-# Overridden by the QMD_EDITOR_URI env var.
-# editor_uri: "vscode://file{path}:{line}:{col}"
+# Model overrides.
+# Embeddings use an external OpenAI-compatible /embeddings API by default.
+# Set QMD_EMBED_API_KEY or OPENAI_API_KEY in the environment for API auth.
+models:
+  embed: text-embedding-3-small
+  # Optional local embedding model instead of the external API:
+  # embed: hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf
+  rerank: hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf
+  generate: hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf
 
-# ─── Model overrides (optional) ──────────────────────────────────────────────
-# Omit to use the built-in GGUF defaults. `qmd init` writes this block
-# pre-filled with the resolved defaults. See "Model Configuration" in the README
-# for the current default URIs (kept there so this template can't go stale).
-# models:
-#   embed: "hf:<user>/<repo>/<file>.gguf"
-#   rerank: "hf:<user>/<repo>/<file>.gguf"
-#   generate: "hf:<user>/<repo>/<file>.gguf"
-
-# ─── Collections ─────────────────────────────────────────────────────────────
+# Collection definitions
 collections:
 
   # ── Basic: just a path and a pattern ───────────────────────────────────────

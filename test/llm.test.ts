@@ -1,10 +1,9 @@
 /**
- * llm.test.ts - Unit tests for the LLM abstraction layer (node-llama-cpp)
+ * llm.test.ts - Unit tests for the LLM abstraction layer
  *
  * Run with: bun test src/llm.test.ts
  *
- * These tests require the actual models to be downloaded. Run the embed or
- * rerank functions first to trigger model downloads.
+ * Integration tests require the actual local GGUF models to be downloaded.
  */
 
 import { describe, test, expect, beforeAll, afterAll, vi } from "vitest";
@@ -619,7 +618,7 @@ describe("LlamaCpp expand context size config", () => {
 });
 
 describe("LlamaCpp model resolution (config > env > default)", () => {
-  const HARDCODED_EMBED = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+  const HARDCODED_EMBED = "text-embedding-3-small";
   const HARDCODED_RERANK = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
   const HARDCODED_GENERATE = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 
@@ -660,11 +659,44 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
       else process.env.QMD_EMBED_MODEL = prev;
     }
   });
+
+  test("default embedding uses external OpenAI-compatible API", async () => {
+    const prevKey = process.env.QMD_EMBED_API_KEY;
+    process.env.QMD_EMBED_API_KEY = "test-key";
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        model: "text-embedding-3-small",
+        data: [{ index: 0, embedding: [0.1, 0.2, 0.3] }],
+      }),
+    } as Response);
+
+    try {
+      const llm = new LlamaCpp({});
+      const result = await llm.embed("hello");
+      expect(fetchMock).toHaveBeenCalledWith("https://api.openai.com/v1/embeddings", expect.objectContaining({
+        method: "POST",
+      }));
+      expect(result).toEqual({
+        embedding: [0.1, 0.2, 0.3],
+        model: "text-embedding-3-small",
+      });
+    } finally {
+      fetchMock.mockRestore();
+      if (prevKey === undefined) delete process.env.QMD_EMBED_API_KEY;
+      else process.env.QMD_EMBED_API_KEY = prevKey;
+    }
+  });
+
+  test("hf embedding model opts into local embedding", () => {
+    const llm = new LlamaCpp({ embedModel: "hf:custom/embed.gguf" });
+    expect(llm.usesLocalEmbedding).toBe(true);
+  });
 });
 
 describe("LlamaCpp embedding truncation", () => {
   test("truncates against the active embedding context limit, not the model train context", async () => {
-    const llm = new LlamaCpp({}) as any;
+    const llm = new LlamaCpp({ embedModel: "hf:test/embed.gguf" }) as any;
     const getEmbeddingFor = vi.fn(async (text: string) => ({
       vector: new Float32Array([0.25, 0.5]),
       text,
@@ -830,11 +862,12 @@ describe("LlamaCpp.getDeviceInfo", () => {
 // =============================================================================
 
 describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
-  // Use the singleton to avoid multiple Metal contexts
-  const llm = getDefaultLlamaCpp();
+  const LOCAL_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+  const llm = new LlamaCpp({ embedModel: LOCAL_EMBED_MODEL });
 
   afterAll(async () => {
     // Ensure native resources are released to avoid ggml-metal asserts on process exit.
+    await llm.dispose();
     await disposeDefaultLlamaCpp();
   });
 
@@ -953,7 +986,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       // The fix uses a promise guard to ensure only one context creation runs at a time.
       // We verify this by instrumenting createEmbeddingContext to count invocations.
       
-      const freshLlm = new LlamaCpp({});
+      const freshLlm = new LlamaCpp({ embedModel: LOCAL_EMBED_MODEL });
       let contextCreateCount = 0;
       
       // Instrument the model's createEmbeddingContext to count calls
