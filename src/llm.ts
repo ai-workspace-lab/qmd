@@ -277,9 +277,9 @@ export type RerankDocument = {
 // Model Configuration
 // =============================================================================
 
-// Embeddings use an OpenAI-compatible API by default.
+// Embeddings use NVIDIA's OpenAI-compatible API by default.
 // Override QMD_EMBED_MODEL with hf:/path/.gguf to opt into local node-llama-cpp embeddings.
-const DEFAULT_EMBED_MODEL = "text-embedding-3-small";
+const DEFAULT_EMBED_MODEL = "nvidia/llama-3.2-nv-embedqa-1b-v2";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 // const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
@@ -326,7 +326,11 @@ const MODEL_CACHE_DIR = process.env.XDG_CACHE_HOME
   : join(homedir(), ".cache", "qmd", "models");
 export const DEFAULT_MODEL_CACHE_DIR = MODEL_CACHE_DIR;
 
-const DEFAULT_EMBED_API_BASE_URL = "https://api.openai.com/v1";
+const DEFAULT_EMBED_API_BASE_URL = "https://integrate.api.nvidia.com/v1";
+
+export function localModelsDisabled(): boolean {
+  return /^(1|true|yes|on)$/i.test(process.env.QMD_DISABLE_LOCAL_MODELS ?? "");
+}
 
 function isLocalEmbeddingModel(model: string): boolean {
   return model.startsWith("hf:") || model.endsWith(".gguf") || model.startsWith("/") || model.startsWith("./") || model.startsWith("../");
@@ -1454,7 +1458,7 @@ export class LlamaCpp implements LLM {
     if (texts.length === 0) return [];
     if (!this.embedApiKey) {
       throw new Error(
-        "External embedding API key is required. Set QMD_EMBED_API_KEY or OPENAI_API_KEY. " +
+        "External embedding API key is required. Set NVIDIA_API_KEY, QMD_EMBED_API_KEY, or OPENAI_API_KEY. " +
         "For local embeddings, set QMD_EMBED_MODEL to an hf: or .gguf model URI."
       );
     }
@@ -1498,6 +1502,9 @@ export class LlamaCpp implements LLM {
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
     const model = options.model ?? this.embedModelUri;
+    if (localModelsDisabled() && isLocalEmbeddingModel(model)) {
+      throw new Error("Local embedding models are disabled. Set QMD_EMBED_MODEL to an external API model.");
+    }
     if (!isLocalEmbeddingModel(model)) {
       const results = await this.embedExternal([text], model, options);
       return results[0] ?? null;
@@ -1533,6 +1540,9 @@ export class LlamaCpp implements LLM {
    */
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
     const model = options.model ?? this.embedModelUri;
+    if (localModelsDisabled() && isLocalEmbeddingModel(model)) {
+      throw new Error("Local embedding models are disabled. Set QMD_EMBED_MODEL to an external API model.");
+    }
     if (!isLocalEmbeddingModel(model)) {
       return this.embedExternal(texts, model, options);
     }
@@ -1664,7 +1674,8 @@ export class LlamaCpp implements LLM {
   // High-level abstractions
   // ==========================================================================
 
-  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
+  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
+    if (localModelsDisabled()) return [];
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1772,6 +1783,12 @@ export class LlamaCpp implements LLM {
     documents: RerankDocument[],
     options: RerankOptions = {}
   ): Promise<RerankResult> {
+    if (localModelsDisabled()) {
+      return {
+        model: "disabled",
+        results: documents.map((doc, index) => ({ file: doc.file, score: 0, index })),
+      };
+    }
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
