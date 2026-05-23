@@ -662,9 +662,9 @@ async function showStatus(): Promise<void> {
     };
     const activeModels = resolveModelsForCli();
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(activeModels.embed)}`);
-    console.log(`  Reranking:   ${hfLink(activeModels.rerank)}`);
-    console.log(`  Generation:  ${hfLink(activeModels.generate)}`);
+    console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
+    console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)} ${c.dim}(optional; set QMD_ENABLE_LOCAL_MODELS=1)${c.reset}`);
+    console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)} ${c.dim}(optional; set QMD_ENABLE_LOCAL_MODELS=1)${c.reset}`);
   }
 
 
@@ -4660,12 +4660,13 @@ if (isMain) {
     case "pull": {
       await resolveLocalConfigTrust();
       const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
-      const activeModels = resolveModelsForRuntime();
+      const isLocalModelUri = (uri: string) =>
+        uri.startsWith("hf:") || uri.endsWith(".gguf") || uri.startsWith("/") || uri.startsWith("./") || uri.startsWith("../");
       const models = [
-        activeModels.embed,
-        activeModels.generate,
-        activeModels.rerank,
-      ];
+        DEFAULT_EMBED_MODEL_URI,
+        DEFAULT_GENERATE_MODEL_URI,
+        DEFAULT_RERANK_MODEL_URI,
+      ].filter(isLocalModelUri);
       console.log(`${c.bold}Pulling models${c.reset}`);
       const results = await pullModels(models, {
         refresh,

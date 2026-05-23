@@ -22,11 +22,13 @@ import { qmdHomedir } from "./paths.js";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
+  approximateTokenCount,
+  truncateByApproxTokens,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   withLLMSessionForLlm,
   DEFAULT_EMBED_MODEL_URI,
-  localModelsDisabled,
+  localModelsEnabled,
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
@@ -3214,6 +3216,15 @@ export async function chunkDocumentByTokens(
   signal?: AbortSignal
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
   const llm = getDefaultLlamaCpp();
+  const useLocalTokenizer = typeof (llm as any).usesLocalEmbedding === "boolean"
+    ? Boolean((llm as any).usesLocalEmbedding)
+    : true;
+
+  const countTokens = async (text: string): Promise<number> => {
+    if (!useLocalTokenizer) return approximateTokenCount(text);
+    const tokens = await llm.tokenize(text);
+    return tokens.length;
+  };
 
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
@@ -3236,18 +3247,13 @@ export async function chunkDocumentByTokens(
   const pushChunkWithinTokenLimit = async (text: string, pos: number): Promise<void> => {
     if (signal?.aborted) return;
 
-    const tokens = await llm.tokenize(text);
-    if (tokens.length <= maxTokens || text.length <= 1) {
-      // Safety net: text.length <= 1 can only legitimately be a single
-      // BMP character (a well-formed astral character needs 2 code units),
-      // so this only ever strips something for already-malformed input.
-      const safeText = stripUnpairedSurrogates(text);
-      if (safeText.length === 0) return;
-      results.push({ text: safeText, pos, tokens: tokens.length });
+    const tokenCount = await countTokens(text);
+    if (tokenCount <= maxTokens || text.length <= 1) {
+      results.push({ text, pos, tokens: tokenCount });
       return;
     }
 
-    const actualCharsPerToken = text.length / tokens.length;
+    const actualCharsPerToken = text.length / tokenCount;
     let safeMaxChars = Math.floor(maxTokens * actualCharsPerToken * 0.95);
     if (!Number.isFinite(safeMaxChars) || safeMaxChars < 1) {
       safeMaxChars = Math.floor(text.length / 2);
@@ -3277,16 +3283,14 @@ export async function chunkDocumentByTokens(
       subChunks.length <= 1
       || subChunks[0]?.text.length === text.length
     ) {
-      const fallbackTokens = tokens.slice(0, Math.max(1, maxTokens));
-      // Safety net: detokenize() reconstructs text from raw token IDs, and
-      // a tokenizer can encode a single astral-plane character across
-      // multiple tokens — truncating the token list can land mid-character.
-      const truncatedText = stripUnpairedSurrogates(await llm.detokenize(fallbackTokens));
-      if (truncatedText.length === 0) return;
+      const tokenLimit = Math.max(1, maxTokens);
+      const truncatedText = useLocalTokenizer
+        ? await llm.detokenize((await llm.tokenize(text)).slice(0, tokenLimit))
+        : truncateByApproxTokens(text, tokenLimit);
       results.push({
         text: truncatedText,
         pos,
-        tokens: fallbackTokens.length,
+        tokens: tokenLimit,
       });
       return;
     }
@@ -5451,7 +5455,7 @@ export async function hybridQuery(
   const collection = options?.collection;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
-  const skipRerank = options?.skipRerank ?? localModelsDisabled();
+  const skipRerank = options?.skipRerank ?? !localModelsEnabled();
   const hooks = options?.hooks;
 
   const rankedLists: RankedResult[][] = [];
@@ -5862,7 +5866,7 @@ export async function structuredSearch(
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
-  const skipRerank = options?.skipRerank ?? localModelsDisabled();
+  const skipRerank = options?.skipRerank ?? !localModelsEnabled();
   const hooks = options?.hooks;
 
   const collections = options?.collections;
