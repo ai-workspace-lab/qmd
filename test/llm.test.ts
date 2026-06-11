@@ -618,7 +618,7 @@ describe("LlamaCpp expand context size config", () => {
 });
 
 describe("LlamaCpp model resolution (config > env > default)", () => {
-  const HARDCODED_EMBED = "nvidia/llama-3.2-nv-embedqa-1b-v2";
+  const HARDCODED_EMBED = "nvidia/llama-nemotron-embed-1b-v2";
   const HARDCODED_RERANK = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
   const HARDCODED_GENERATE = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 
@@ -672,7 +672,7 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue({
       ok: true,
       json: async () => ({
-        model: "nvidia/llama-3.2-nv-embedqa-1b-v2",
+        model: "nvidia/llama-nemotron-embed-1b-v2",
         data: [{ index: 0, embedding: [0.1, 0.2, 0.3] }],
       }),
     } as Response);
@@ -685,13 +685,13 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
       }));
       const [, init] = fetchMock.mock.calls[0]!;
       expect(JSON.parse((init as RequestInit).body as string)).toEqual({
-        model: "nvidia/llama-3.2-nv-embedqa-1b-v2",
+        model: "nvidia/llama-nemotron-embed-1b-v2",
         input: ["hello"],
         input_type: "passage",
       });
       expect(result).toEqual({
         embedding: [0.1, 0.2, 0.3],
-        model: "nvidia/llama-3.2-nv-embedqa-1b-v2",
+        model: "nvidia/llama-nemotron-embed-1b-v2",
       });
     } finally {
       fetchMock.mockRestore();
@@ -716,17 +716,17 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue({
       ok: true,
       json: async () => ({
-        model: "nvidia/llama-3.2-nv-embedqa-1b-v2",
+        model: "nvidia/llama-nemotron-embed-1b-v2",
         data: [{ index: 0, embedding: [0.1, 0.2, 0.3] }],
       }),
     } as Response);
 
     try {
-      const llm = new LlamaCpp({ embedModel: "nvidia/llama-3.2-nv-embedqa-1b-v2" });
+      const llm = new LlamaCpp({ embedModel: "nvidia/llama-nemotron-embed-1b-v2" });
       await llm.embed("hello", { isQuery: true });
       const [, init] = fetchMock.mock.calls[0]!;
       expect(JSON.parse((init as RequestInit).body as string)).toEqual({
-        model: "nvidia/llama-3.2-nv-embedqa-1b-v2",
+        model: "nvidia/llama-nemotron-embed-1b-v2",
         input: ["hello"],
         input_type: "query",
       });
@@ -791,7 +791,7 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
   });
 
   test("external embedding token counting does not load a local tokenizer", async () => {
-    const llm = new LlamaCpp({ embedModel: "nvidia/llama-3.2-nv-embedqa-1b-v2" }) as any;
+    const llm = new LlamaCpp({ embedModel: "nvidia/llama-nemotron-embed-1b-v2" }) as any;
     llm.ensureEmbedContext = vi.fn(async () => {
       throw new Error("should not load local tokenizer");
     });
@@ -986,15 +986,26 @@ describe("LlamaCpp.getDeviceInfo", () => {
 describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
   const LOCAL_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
   const llm = new LlamaCpp({ embedModel: LOCAL_EMBED_MODEL });
+  const prevEnableLocalModels = process.env.QMD_ENABLE_LOCAL_MODELS;
+  const it = (name: string, fn: () => Promise<void> | void) => test(name, fn, 30000);
+
+  beforeAll(() => {
+    process.env.QMD_ENABLE_LOCAL_MODELS = "1";
+  });
 
   afterAll(async () => {
     // Ensure native resources are released to avoid ggml-metal asserts on process exit.
     await llm.dispose();
     await disposeDefaultLlamaCpp();
+    if (prevEnableLocalModels === undefined) {
+      delete process.env.QMD_ENABLE_LOCAL_MODELS;
+    } else {
+      process.env.QMD_ENABLE_LOCAL_MODELS = prevEnableLocalModels;
+    }
   });
 
   describe("embed", () => {
-    test("returns embedding with correct dimensions", async () => {
+    it("returns embedding with correct dimensions", async () => {
       const result = await llm.embed("Hello world");
 
       expect(result).not.toBeNull();
@@ -1004,7 +1015,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       expect(result!.embedding.length).toBe(768);
     });
 
-    test("returns consistent embeddings for same input", async () => {
+    it("returns consistent embeddings for same input", async () => {
       const result1 = await llm.embed("test text");
       const result2 = await llm.embed("test text");
 
@@ -1017,7 +1028,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       }
     });
 
-    test("returns different embeddings for different inputs", async () => {
+    it("returns different embeddings for different inputs", async () => {
       const result1 = await llm.embed("cats are great");
       const result2 = await llm.embed("database optimization");
 
@@ -1042,7 +1053,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
   });
 
   describe("embedBatch", () => {
-    test("returns embeddings for multiple texts", async () => {
+    it("returns embeddings for multiple texts", async () => {
       const texts = ["Hello world", "Test text", "Another document"];
       const results = await llm.embedBatch(texts);
 
@@ -1053,7 +1064,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       }
     });
 
-    test("returns same results as individual embed calls", async () => {
+    it("returns same results as individual embed calls", async () => {
       const texts = ["cats are great", "dogs are awesome"];
 
       // Get batch embeddings
@@ -1072,12 +1083,12 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       }
     });
 
-    test("handles empty array", async () => {
+    it("handles empty array", async () => {
       const results = await llm.embedBatch([]);
       expect(results).toHaveLength(0);
     });
 
-    test("batch is faster than sequential", async () => {
+    it("batch is faster than sequential", async () => {
       const texts = Array(10).fill(null).map((_, i) => `Document number ${i} with content`);
 
       // Time batch
@@ -1097,7 +1108,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       expect(batchTime).toBeLessThanOrEqual(seqTime * 3);
     });
 
-    test("handles concurrent embedBatch calls on fresh instance without race condition", async () => {
+    it("handles concurrent embedBatch calls on fresh instance without race condition", async () => {
       // This test verifies the fix for a race condition where concurrent calls to
       // ensureEmbedContext() could create multiple contexts. Without the promise guard,
       // each concurrent embedBatch call sees embedContext === null and creates its own
@@ -1161,7 +1172,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
   });
 
   describe("rerank", () => {
-    test("scores capital of France question correctly", async () => {
+    it("scores capital of France question correctly", async () => {
       const query = "What is the capital of France?";
       const documents: RerankDocument[] = [
         { file: "butterflies.txt", text: "Butterflies indeed fly through the garden." },
@@ -1185,7 +1196,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       expect(result.results[2]!.score).toBeLessThan(0.6);
     });
 
-    test("scores authentication query correctly", async () => {
+    it("scores authentication query correctly", async () => {
       const query = "How do I configure authentication?";
       const documents: RerankDocument[] = [
         { file: "weather.md", text: "The weather today is sunny with mild temperatures." },
@@ -1209,7 +1220,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       expect(bottomTwo).toContain("pizza.md");
     });
 
-    test("handles programming queries correctly", async () => {
+    it("handles programming queries correctly", async () => {
       const query = "How do I handle errors in JavaScript?";
       const documents: RerankDocument[] = [
         { file: "cooking.md", text: "To make a good pasta, boil water and add salt." },
@@ -1228,18 +1239,18 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       expect(result.results[2]!.file).toBe("cooking.md");
     });
 
-    test("handles empty document list", async () => {
+    it("handles empty document list", async () => {
       const result = await llm.rerank("test query", []);
       expect(result.results).toHaveLength(0);
     });
 
-    test("handles single document", async () => {
+    it("handles single document", async () => {
       const result = await llm.rerank("test", [{ file: "doc.md", text: "content" }]);
       expect(result.results).toHaveLength(1);
       expect(result.results[0]!.file).toBe("doc.md");
     });
 
-    test("preserves original file paths", async () => {
+    it("preserves original file paths", async () => {
       const documents: RerankDocument[] = [
         { file: "path/to/doc1.md", text: "content one" },
         { file: "another/path/doc2.md", text: "content two" },
@@ -1251,7 +1262,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       expect(files).toEqual(["another/path/doc2.md", "path/to/doc1.md"]);
     });
 
-    test("returns scores between 0 and 1", async () => {
+    it("returns scores between 0 and 1", async () => {
       const documents: RerankDocument[] = [
         { file: "a.md", text: "The quick brown fox jumps over the lazy dog." },
         { file: "b.md", text: "Machine learning algorithms process data efficiently." },
@@ -1266,7 +1277,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       }
     });
 
-    test("batch reranks multiple documents efficiently", async () => {
+    it("batch reranks multiple documents efficiently", async () => {
       // Create 10 documents to verify batch processing works
       const documents: RerankDocument[] = Array(10)
         .fill(null)
@@ -1291,7 +1302,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       console.log(`Batch rerank of 10 docs took ${elapsed}ms`);
     });
 
-    test("uses fewer active rerank contexts for small batches", async () => {
+    it("uses fewer active rerank contexts for small batches", async () => {
       const freshLlm = new LlamaCpp({});
       const calls: number[] = [];
       const fakeModel = {
@@ -1319,7 +1330,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       expect(calls).toEqual([0, 1]);
     });
 
-    test("truncates and reranks document exceeding 2048 token context size", async () => {
+    it("truncates and reranks document exceeding 2048 token context size", async () => {
       // The reranker context is created with contextSize=2048. Documents that
       // exceed the token budget (contextSize - template overhead - query tokens)
       // should be silently truncated rather than crashing.
@@ -1360,7 +1371,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
   });
 
   describe("expandQuery", () => {
-    test("returns query expansions with correct types", async () => {
+    it("returns query expansions with correct types", async () => {
       const result = await llm.expandQuery("test query");
 
       // Result is Queryable[] containing lex, vec, and/or hyde entries
@@ -1373,7 +1384,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       }
     }, 30000); // 30s timeout for model loading
 
-    test("can exclude lexical queries", async () => {
+    it("can exclude lexical queries", async () => {
       const result = await llm.expandQuery("authentication setup", { includeLexical: false });
 
       // Should not contain any 'lex' type entries
@@ -1388,8 +1399,23 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
 // =============================================================================
 
 describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
+  const prevEnableLocalModels = process.env.QMD_ENABLE_LOCAL_MODELS;
+  const it = (name: string, fn: () => Promise<void> | void) => test(name, fn, 30000);
+
+  beforeAll(() => {
+    process.env.QMD_ENABLE_LOCAL_MODELS = "1";
+  });
+
+  afterAll(() => {
+    if (prevEnableLocalModels === undefined) {
+      delete process.env.QMD_ENABLE_LOCAL_MODELS;
+    } else {
+      process.env.QMD_ENABLE_LOCAL_MODELS = prevEnableLocalModels;
+    }
+  });
+
   describe("withLLMSession", () => {
-    test("session provides access to LLM operations", async () => {
+    it("session provides access to LLM operations", async () => {
       const result = await withLLMSession(async (session) => {
         expect(session.isValid).toBe(true);
         const embedding = await session.embed("test text");
@@ -1400,7 +1426,7 @@ describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
       expect(result).toBe("success");
     });
 
-    test("session is invalid after release", async () => {
+    it("session is invalid after release", async () => {
       let capturedSession: ILLMSession | null = null;
 
       await withLLMSession(async (session) => {
@@ -1413,7 +1439,7 @@ describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
       expect(capturedSession!.isValid).toBe(false);
     });
 
-    test("session prevents idle unload during operations", async () => {
+    it("session prevents idle unload during operations", async () => {
       await withLLMSession(async (session) => {
         // While inside a session, canUnloadLLM should return false
         expect(canUnloadLLM()).toBe(false);
@@ -1429,7 +1455,7 @@ describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
       expect(canUnloadLLM()).toBe(true);
     });
 
-    test("nested sessions increment ref count", async () => {
+    it("nested sessions increment ref count", async () => {
       await withLLMSession(async (outerSession) => {
         expect(canUnloadLLM()).toBe(false);
 
@@ -1448,7 +1474,7 @@ describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
       expect(canUnloadLLM()).toBe(true);
     });
 
-    test("session embedBatch works correctly", async () => {
+    it("session embedBatch works correctly", async () => {
       await withLLMSession(async (session) => {
         const texts = ["Hello world", "Test text", "Another document"];
         const results = await session.embedBatch(texts);
@@ -1461,7 +1487,7 @@ describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
       });
     });
 
-    test("session rerank works correctly", async () => {
+    it("session rerank works correctly", async () => {
       await withLLMSession(async (session) => {
         const documents: RerankDocument[] = [
           { file: "a.txt", text: "The capital of France is Paris." },
@@ -1476,7 +1502,7 @@ describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
       });
     });
 
-    test("max duration aborts session after timeout", async () => {
+    it("max duration aborts session after timeout", async () => {
       let aborted = false;
 
       try {
@@ -1498,7 +1524,7 @@ describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
       expect(aborted).toBe(true);
     }, 5000);
 
-    test("external abort signal propagates to session", async () => {
+    it("external abort signal propagates to session", async () => {
       const abortController = new AbortController();
       let sessionAborted = false;
 
@@ -1526,14 +1552,14 @@ describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
       expect(sessionAborted).toBe(true);
     }, 5000);
 
-    test("session provides abort signal for monitoring", async () => {
+    it("session provides abort signal for monitoring", async () => {
       await withLLMSession(async (session) => {
         expect(session.signal).toBeInstanceOf(AbortSignal);
         expect(session.signal.aborted).toBe(false);
       });
     });
 
-    test("returns value from callback", async () => {
+    it("returns value from callback", async () => {
       const result = await withLLMSession(async (session) => {
         await session.embed("test");
         return { status: "complete", count: 42 };
@@ -1542,7 +1568,7 @@ describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
       expect(result).toEqual({ status: "complete", count: 42 });
     });
 
-    test("propagates errors from callback", async () => {
+    it("propagates errors from callback", async () => {
       const customError = new Error("Custom test error");
 
       await expect(

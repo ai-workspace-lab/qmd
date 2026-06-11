@@ -3077,7 +3077,15 @@ function parseCLI() {
       http: { type: "boolean" },
       daemon: { type: "boolean" },
       port: { type: "string" },
+      // Sync options
       host: { type: "string" },
+      "remote-user": { type: "string" },
+      "remote-qmd-user": { type: "string" },
+      "remote-home": { type: "string" },
+      "dry-run": { type: "boolean" },
+      delete: { type: "boolean" },
+      update: { type: "boolean" },
+      embed: { type: "boolean" },
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -3580,6 +3588,7 @@ function showHelp(): void {
   console.log("  qmd skills list/get/path      - List and retrieve bundled runtime skills");
   console.log("  qmd skill show/install        - Show or install the QMD skill");
   console.log("  qmd mcp                       - Start the MCP server (stdio transport for AI agents)");
+  console.log("  qmd sync [--dry-run]          - Secure two-way sync with a remote QMD host");
   console.log("  qmd bench <fixture.json>      - Run search quality benchmarks against a fixture file");
   console.log("");
   console.log("Collections & context:");
@@ -3595,9 +3604,8 @@ function showHelp(): void {
   console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
-  console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30)");
-  console.log("  qmd pull [--refresh] [--progress] - Download embedding/generation/rerank models");
-  console.log("  qmd cleanup [--dry-run]       - Drop inactive docs/orphans, compact FTS, vacuum");
+  console.log("  qmd cleanup                   - Clear caches, vacuum DB");
+  console.log("  qmd sync --dry-run            - Preview SSH/rsync sync against the default remote");
   console.log("");
   console.log("Query syntax (qmd query):");
   console.log("  QMD queries are either a single expand query (no prefix) or a multi-line");
@@ -3644,6 +3652,16 @@ function showHelp(): void {
   console.log("Global options:");
   console.log("  --index <name>             - Use a named index (default: index)");
   console.log("  QMD_EDITOR_URI             - Editor link template for clickable TTY search output");
+  console.log("");
+  console.log("Sync options:");
+  console.log("  --host <user@host>         - SSH target (default root@xworkmate-bridge.svc.plus)");
+  console.log("  --remote-qmd-user <user>   - Remote QMD owner (default ubuntu)");
+  console.log("  --remote-home <path>       - Remote QMD home (default /home/ubuntu)");
+  console.log("  --dry-run                  - Preview without writing files");
+  console.log("  --delete                   - Allow rsync deletes after conflict filtering");
+  console.log("  --update                   - Run qmd update locally and remotely after successful sync");
+  console.log("  --embed                    - With --update, run qmd embed locally and remotely");
+  console.log("  --yes                      - Reserved for non-interactive apply flows");
   console.log("");
   console.log("Search options:");
   console.log("  -n <num>                   - Max results (default 5, or 20 for --format files|json)");
@@ -4325,6 +4343,31 @@ if (isMain) {
     process.exit(0);
   }
 
+  if (cli.values.help && cli.command === "sync") {
+    console.log("Usage: qmd sync [options]");
+    console.log("");
+    console.log("Synchronize QMD source files and YAML config with a remote QMD host.");
+    console.log("SQLite indexes are intentionally not synced; run qmd update/embed manually after sync.");
+    console.log("");
+    console.log("Options:");
+    console.log("  --host <user@host>          SSH target (default root@xworkmate-bridge.svc.plus)");
+    console.log("  --remote-qmd-user <user>    Remote QMD owner (default ubuntu)");
+    console.log("  --remote-home <path>        Remote QMD home (default /home/ubuntu)");
+    console.log("  -c, --collection <name>     Limit sync to one or more collection names; skips config sync");
+    console.log("  --dry-run                   Preview rsync changes without writing files");
+    console.log("  --delete                    Allow deletes after conflict filtering");
+    console.log("  --update                    Run qmd update locally and remotely after successful sync");
+    console.log("  --embed                     With --update, run qmd embed locally and remotely");
+    console.log("  --json                      Print a machine-readable summary");
+    console.log("");
+    console.log("Examples:");
+    console.log("  qmd sync --dry-run");
+    console.log("  qmd sync --dry-run --update");
+    console.log("  qmd sync --host root@xworkmate-bridge.svc.plus --remote-qmd-user ubuntu");
+    console.log("  qmd sync --collection openclaw-workspace");
+    process.exit(0);
+  }
+
   if (!cli.command || cli.values.help) {
     showHelp();
     process.exit(cli.values.help ? 0 : 1);
@@ -4656,6 +4699,42 @@ if (isMain) {
         exitWithError(error);
       }
       break;
+
+    case "sync": {
+      try {
+        const { runQmdSync, formatSyncSummary } = await import("../sync.js");
+        const summary = await runQmdSync({
+          host: cli.values.host as string | undefined,
+          remoteUser: cli.values["remote-user"] as string | undefined,
+          remoteQmdUser: cli.values["remote-qmd-user"] as string | undefined,
+          remoteHome: cli.values["remote-home"] as string | undefined,
+          collection: Array.isArray(cli.opts.collection)
+            ? cli.opts.collection
+            : cli.opts.collection
+              ? [cli.opts.collection]
+              : undefined,
+          dryRun: Boolean(cli.values["dry-run"]),
+          delete: Boolean(cli.values.delete),
+          update: Boolean(cli.values.update),
+          embed: Boolean(cli.values.embed),
+          yes: Boolean(cli.values.yes),
+          json: cli.opts.format === "json",
+          localQmdCommand: [process.execPath, fileURLToPath(import.meta.url)],
+        });
+        if (cli.opts.format === "json") {
+          console.log(JSON.stringify(summary, null, 2));
+        } else {
+          console.log(formatSyncSummary(summary));
+        }
+        if (summary.failed) {
+          process.exit(1);
+        }
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exit(1);
+      }
+      break;
+    }
 
     case "pull": {
       await resolveLocalConfigTrust();
