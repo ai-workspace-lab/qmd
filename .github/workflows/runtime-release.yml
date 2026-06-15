@@ -46,6 +46,7 @@ jobs:
               mkdir -p /out/qmd
               cp -a bin dist node_modules package.json package-lock.json LICENSE /out/qmd/
             '
+          sudo chown -R "$(id -u):$(id -g)" dist/runtime
           cat > dist/runtime/qmd/manifest.json <<JSON
           {
             "component": "qmd",
