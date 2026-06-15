@@ -1,0 +1,100 @@
+name: Build QMD Runtime Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: qmd-runtime-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build linux-${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - name: Build target runtime
+        env:
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/assets dist/runtime
+          docker run --rm --platform "linux/${TARGET_ARCH}" \
+            -v "${PWD}:/src:ro" \
+            -v "${PWD}/dist/runtime:/out" \
+            node:24-bookworm \
+            bash -lc '
+              set -euo pipefail
+              cp -a /src/. /tmp/qmd/
+              rm -rf /tmp/qmd/.git /tmp/qmd/dist
+              cd /tmp/qmd
+              npm install --no-audit --no-fund
+              npm run build
+              npm prune --omit=dev --no-audit --no-fund
+              mkdir -p /out/qmd
+              cp -a bin dist node_modules package.json package-lock.json LICENSE /out/qmd/
+            '
+          cat > dist/runtime/qmd/manifest.json <<JSON
+          {
+            "component": "qmd",
+            "commit": "${GITHUB_SHA}",
+            "os": "linux",
+            "arch": "${TARGET_ARCH}",
+            "binary": "bin/qmd"
+          }
+          JSON
+          tar -czf "dist/assets/qmd-runtime-linux-${TARGET_ARCH}.tar.gz" \
+            -C dist/runtime qmd
+          (
+            cd dist/assets
+            sha256sum -- ./*.tar.gz | sed 's# \./# #' > "SHA256SUMS-${TARGET_ARCH}"
+          )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qmd-runtime-linux-${{ matrix.arch }}
+          path: |
+            dist/assets/*.tar.gz
+            dist/assets/SHA256SUMS-*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: qmd-runtime-linux-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="runtime-${GITHUB_SHA::12}"
+          cat dist/SHA256SUMS-* | sort -u > dist/SHA256SUMS
+          rm -f dist/SHA256SUMS-*
+          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${tag}" dist/*.tar.gz dist/SHA256SUMS \
+              --repo "${GITHUB_REPOSITORY}" --clobber
+          else
+            gh release create "${tag}" dist/*.tar.gz dist/SHA256SUMS \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --title "QMD runtime ${GITHUB_SHA::12}" \
+              --notes "Prebuilt Linux QMD runtimes. No target-host npm build is required."
+          fi
