@@ -134,6 +134,27 @@ qmd multi-get "#abc123, #def456"
                          # legacy --json/--csv/--md/--xml/--files still work as aliases
 ```
 
+## PostgreSQL memory bridge (optional)
+
+QMD can additionally run as a shared, namespaced memory store backed by
+PostgreSQL (`pgvector` + `pg_jieba` + `pg_trgm`, e.g. `postgresql.svc.plus`) for
+external agents (OpenClaw, Hermes). SQLite remains the default and is unchanged.
+
+```sh
+export QMD_BACKEND=pg
+export QMD_PG_URL='postgres://user:pass@host:5443/db'   # stunnel TLS port
+export QMD_NAMESPACE=openclaw                            # tenant isolation
+
+qmd pg status                              # backend health
+qmd memory add <key> "text" --title T      # store/replace (text or stdin)
+qmd memory search <query>                  # hybrid FTS(pg_jieba)+vector(pgvector), RRF
+qmd memory get|rm|ls|namespaces
+```
+
+When `QMD_BACKEND=pg`, `qmd mcp` also exposes `memory_add/memory_search/
+memory_get/memory_list` tools. Code lives in `src/pg/`. Design + usage:
+`docs/plan/pg-backend-memory-bridge.md`, `docs/plan/pg-memory-bridge-usage.md`.
+
 ## Development
 
 ```sh

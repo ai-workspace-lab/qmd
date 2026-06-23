@@ -4,6 +4,20 @@
 
 ### Changes
 
+- Backend: add an optional **PostgreSQL memory bridge** so qmd can act as a
+  shared, namespaced, persistent memory store for external agents (OpenClaw,
+  Hermes, …) on top of `pgvector` + `pg_jieba` + `pg_trgm` (e.g. the
+  `postgresql.svc.plus` runtime). The local SQLite document workflow is the
+  default and is unchanged. Enable with `QMD_BACKEND=pg` and `QMD_PG_URL`.
+  - CLI: `qmd memory add|search|get|rm|ls|namespaces` and `qmd pg status`.
+  - MCP: when `QMD_BACKEND=pg`, `qmd mcp` also exposes `memory_add`,
+    `memory_search`, `memory_get`, and `memory_list` tools alongside the
+    existing document-search tools.
+  - Search is hybrid: `pg_jieba/tsvector` lexical + `pgvector` cosine, fused
+    with Reciprocal Rank Fusion; embeddings reuse the same external embedding
+    API as the SQLite engine. Memory is isolated per `QMD_NAMESPACE`.
+  - See `docs/plan/pg-memory-bridge-usage.md` for configuration and
+    `docs/plan/pg-backend-memory-bridge.md` for the design.
 - CLI: add `qmd sync` for SSH/rsync-based QMD source-file and YAML-config
   synchronization between a local machine and remote QMD host. The sync path
   uses resumable rsync transfers, conflict-copy preservation, and keeps SQLite

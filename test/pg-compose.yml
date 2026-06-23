@@ -1,0 +1,24 @@
+# Local PostgreSQL for qmd memory-bridge integration tests.
+#
+#   docker compose -f test/pg-compose.yml up -d
+#   QMD_PG_URL='postgres://postgres:postgres@localhost:5432/postgres' \
+#     npx vitest run test/pg-memory.integration.test.ts
+#   docker compose -f test/pg-compose.yml down -v
+#
+# pgvector/pgvector ships pgvector but NOT pg_jieba, so FTS falls back to the
+# 'english' text-search config. For full Chinese tokenization use the
+# postgresql.svc.plus image (ghcr.io/x-evor/images/postgresql) which bundles
+# pgvector + pg_jieba + pg_trgm.
+services:
+  qmd-pg:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 20

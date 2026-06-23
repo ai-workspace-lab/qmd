@@ -116,22 +116,8 @@ import {
   type CollectionConfig,
   type ModelsConfig,
 } from "../collections.js";
-import {
-  decideLocalConfigGate,
-  gatedItems,
-  hasGatedItems,
-  isCollectionPathInsideProject,
-  isLocalConfigPath,
-  isLocalConfigTrustOptedIn,
-  isTrusted,
-  listTrusted,
-  recordTrust,
-  revokeTrust,
-  sensitiveDigest,
-  type BuiltinModels,
-  type GatedItems,
-  type SensitiveSnapshot,
-} from "../trust.js";
+import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
+import { runMemoryCommand, runPgCommand } from "./pg-commands.js";
 
 // NOTE: enableProductionMode() is intentionally NOT called at module scope here.
 // Importing this module for its exports (e.g. buildEditorUri, termLink from
@@ -3086,6 +3072,9 @@ function parseCLI() {
       delete: { type: "boolean" },
       update: { type: "boolean" },
       embed: { type: "boolean" },
+      // Memory bridge (PG backend) options
+      namespace: { type: "string" },  // tenant namespace (openclaw/hermes/...)
+      title: { type: "string" },      // memory title
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -3588,6 +3577,8 @@ function showHelp(): void {
   console.log("  qmd skills list/get/path      - List and retrieve bundled runtime skills");
   console.log("  qmd skill show/install        - Show or install the QMD skill");
   console.log("  qmd mcp                       - Start the MCP server (stdio transport for AI agents)");
+  console.log("  qmd memory add/search/get/rm  - Shared PG memory bridge (needs QMD_BACKEND=pg)");
+  console.log("  qmd pg status                 - Show PostgreSQL memory backend health");
   console.log("  qmd sync [--dry-run]          - Secure two-way sync with a remote QMD host");
   console.log("  qmd bench <fixture.json>      - Run search quality benchmarks against a fixture file");
   console.log("");
@@ -5024,6 +5015,17 @@ if (isMain) {
 
       closeDb();
       break;
+    }
+
+    case "memory":
+    case "mem": {
+      const code = await runMemoryCommand(cli.args, cli.values);
+      process.exit(code);
+    }
+
+    case "pg": {
+      const code = await runPgCommand(cli.args, cli.values);
+      process.exit(code);
     }
 
     default:
