@@ -176,3 +176,55 @@ export async function ensureVectorIndex(client: PgClient, dimensions: number): P
 export async function detectFtsConfig(client: PgClient): Promise<string> {
   return (await hasTsConfig(client, "jiebacfg")) ? "jiebacfg" : "english";
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task coordination layer
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Create the task-claim table. Deliberately separate from `bootstrapSchema`:
+ * coordination needs neither pgvector nor pg_jieba, and `qmd task who` must stay
+ * fast and dependency-light enough to run from an editor hook on every write.
+ * Idempotent.
+ */
+export async function bootstrapTaskSchema(client: PgClient): Promise<void> {
+  await client.exec(`
+    CREATE TABLE IF NOT EXISTS qmd_task_claim (
+      id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      scope         text NOT NULL,
+      resource      text NOT NULL,
+      agent_id      text NOT NULL,
+      agent_kind    text NOT NULL DEFAULT 'unknown',
+      intent        text NOT NULL DEFAULT '',
+      branch        text,
+      worktree      text,
+      pr_number     integer,
+      base_sha      text,
+      status        text NOT NULL DEFAULT 'active',
+      claimed_at    timestamptz NOT NULL DEFAULT now(),
+      heartbeat_at  timestamptz NOT NULL DEFAULT now(),
+      ttl_seconds   integer NOT NULL DEFAULT 1800,
+      released_at   timestamptz,
+      note          text
+    )
+  `);
+
+  // The pivot of the whole design: "one active claim per resource" is a
+  // database constraint, not an application-level gentlemen's agreement.
+  // Partial, so released/abandoned history rows accumulate freely.
+  await tryExec(
+    client,
+    `CREATE UNIQUE INDEX IF NOT EXISTS qmd_task_claim_active_uniq
+       ON qmd_task_claim (scope, resource) WHERE status = 'active'`,
+  );
+  await tryExec(
+    client,
+    `CREATE INDEX IF NOT EXISTS qmd_task_claim_scope_idx
+       ON qmd_task_claim (scope, status, heartbeat_at DESC)`,
+  );
+  await tryExec(
+    client,
+    `CREATE INDEX IF NOT EXISTS qmd_task_claim_agent_idx
+       ON qmd_task_claim (agent_id, status)`,
+  );
+}

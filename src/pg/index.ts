@@ -9,8 +9,23 @@
 import { LlamaCpp } from "../llm.js";
 import { resolvePgConfig, isPgBackend, type PgConnectionConfig } from "./config.js";
 import { PgMemoryStore } from "./memory-store.js";
+import { PgTaskStore } from "./task-store.js";
+import { resolveScope, resolveAgentId, resolveAgentKind } from "./task-scope.js";
 
 export { PgMemoryStore } from "./memory-store.js";
+export { PgTaskStore } from "./task-store.js";
+export type { TaskClaim, ClaimInput, ClaimResult, ClaimStatus } from "./task-store.js";
+export {
+  resolveScope,
+  resolveAgentId,
+  resolveAgentKind,
+  resolveBranch,
+  resolveBaseSha,
+  resolveWorktree,
+  describeDrift,
+  normalizeRemote,
+} from "./task-scope.js";
+export type { AgentKind } from "./task-scope.js";
 export type {
   AddMemoryInput,
   AddMemoryResult,
@@ -66,5 +81,47 @@ export async function openMemoryBridge(
       await store.close();
       await llm.dispose();
     },
+  };
+}
+
+export interface TaskBridge {
+  store: PgTaskStore;
+  config: PgConnectionConfig;
+  scope: string;
+  agentId: string;
+  agentKind: string;
+  dispose(): Promise<void>;
+}
+
+/**
+ * Open the coordination layer.
+ *
+ * Deliberately lighter than `openMemoryBridge`: claims are never embedded, so
+ * no LlamaCpp instance is constructed. `qmd task who` runs on the pre-write hook
+ * path of every editor keystroke-to-disk, and paying model-loading latency
+ * there would guarantee the hook gets disabled.
+ */
+export async function openTaskBridge(
+  opts: { scope?: string; agentId?: string } = {},
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<TaskBridge> {
+  if (!isPgBackend(env)) {
+    throw new Error(
+      "PostgreSQL backend is not selected. Set QMD_BACKEND=pg and QMD_PG_URL to use task commands.",
+    );
+  }
+  const config = resolvePgConfig(env);
+  const scope = resolveScope(opts.scope, env);
+  const agentId = resolveAgentId(opts.agentId, env);
+  const agentKind = resolveAgentKind(env);
+  const store = await PgTaskStore.open(config, scope);
+
+  return {
+    store,
+    config,
+    scope,
+    agentId,
+    agentKind,
+    dispose: () => store.close(),
   };
 }

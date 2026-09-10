@@ -155,6 +155,38 @@ When `QMD_BACKEND=pg`, `qmd mcp` also exposes `memory_add/memory_search/
 memory_get/memory_list` tools. Code lives in `src/pg/`. Design + usage:
 `docs/plan/pg-backend-memory-bridge.md`, `docs/plan/pg-memory-bridge-usage.md`.
 
+## Task coordination (PG backend, optional)
+
+When several agents (Claude Code, OpenCode, Codex, Antigravity) work the same
+repo, `qmd task` gives them one shared view of who is touching what. Needs the
+PG backend but *not* pgvector or an embedder.
+
+```sh
+export QMD_BACKEND=pg
+export QMD_PG_URL='postgres://user:pass@host:5443/db'
+
+qmd task claim <path> --intent "..."   # take an advisory claim before editing
+qmd task who <path>                    # exit 1 when another agent holds it
+qmd task release <path> [--status done|abandoned] [--note ...]
+qmd task heartbeat <path>              # extend a long-running claim
+qmd task ls [--stale] | history | scopes | status
+```
+
+`scope` (the project key) is derived from the git remote, so SSH and HTTPS
+clones coordinate together; override with `--scope` or `$QMD_TASK_SCOPE`.
+Identity comes from `$QMD_AGENT_ID` or is auto-detected per client.
+
+Claims are **advisory**. Only some clients can enforce a pre-write hook, so a
+missed claim loses coordination, never correctness — nothing here ever blocks an
+edit, and an unreachable PostgreSQL degrades to "no coordination".
+
+`qmd mcp` additionally exposes `task_claim/task_who/task_release/task_board/
+task_heartbeat`. With one shared `qmd mcp --http --daemon`, pass `scope` or
+`cwd` to those tools: the daemon's own directory is not the caller's project.
+
+Design: `docs/plan/agent-task-coordination.md`. Code: `src/pg/task-store.ts`,
+`src/pg/task-scope.ts`.
+
 ## Development
 
 ```sh

@@ -28,7 +28,17 @@ import {
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
 import { enableProductionMode } from "../store.js";
-import { isPgBackend, openMemoryBridge, type MemoryBridge } from "../pg/index.js";
+import {
+  isPgBackend,
+  openMemoryBridge,
+  openTaskBridge,
+  resolveScope,
+  resolveBranch,
+  resolveBaseSha,
+  describeDrift,
+  type MemoryBridge,
+  type TaskBridge,
+} from "../pg/index.js";
 
 enableProductionMode();
 
@@ -169,7 +179,11 @@ async function buildInstructions(store: QMDStore): Promise<string> {
  * Create an MCP server with all QMD tools, resources, and prompts registered.
  * Shared by both stdio and HTTP transports.
  */
-async function createMcpServer(store: QMDStore, memory?: MemoryBridge): Promise<McpServer> {
+async function createMcpServer(
+  store: QMDStore,
+  memory?: MemoryBridge,
+  task?: TaskBridge,
+): Promise<McpServer> {
   const server = new McpServer(
     { name: "qmd", version: getPackageVersion() },
     {
@@ -588,6 +602,9 @@ Intent-aware lex (C++ performance, not sports):
   if (memory) {
     registerMemoryTools(server, memory);
   }
+  if (task) {
+    registerTaskTools(server, task);
+  }
 
   return server;
 }
@@ -704,6 +721,202 @@ function registerMemoryTools(server: McpServer, memory: MemoryBridge): void {
         ? rows.map((r) => `- ${r.key} (#${r.docid}) ${r.title}`).join("\n")
         : "No memories.";
       return { content: [{ type: "text", text }], structuredContent: { memories: rows } };
+    },
+  );
+}
+
+/**
+ * Register the PG-backed task coordination tools.
+ *
+ * Scope resolution deserves care here. In the recommended topology a single
+ * `qmd mcp --http --daemon` serves every client, so the *server's* cwd is not
+ * the caller's project — deriving the scope from `process.cwd()` would file all
+ * four clients' claims under whatever directory the daemon happened to start
+ * in. Tools therefore accept `scope` (explicit) or `cwd` (derive from that
+ * checkout), and only fall back to the bridge default for the stdio case where
+ * server and caller do share a directory.
+ */
+function registerTaskTools(server: McpServer, task: TaskBridge): void {
+  const scopeOf = (scope?: string, cwd?: string): string =>
+    scope?.trim() || (cwd ? resolveScope(undefined, process.env, cwd) : task.scope);
+
+  server.registerTool(
+    "task_claim",
+    {
+      title: "Claim a resource",
+      description:
+        "Take an advisory claim on a file or area before you edit it, so other agents " +
+        "(Claude Code, OpenCode, Codex, Antigravity) working the same repo can see it. " +
+        "Call this BEFORE your first write to a file. If it returns ok=false another " +
+        "agent holds it: coordinate, pick different work, or re-call with force=true. " +
+        "Claims are advisory — they never block you, they only tell you the truth.",
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+      inputSchema: {
+        resource: z
+          .string()
+          .describe("Repo-relative path, or a glob like '.github/workflows/*' for an area"),
+        intent: z.string().optional().describe("One line: what you are about to change"),
+        scope: z.string().optional().describe("Project key; omit to derive from cwd"),
+        cwd: z.string().optional().describe("Checkout directory the resource lives in"),
+        ttl_seconds: z.number().optional().describe("Claim lifetime, default 1800"),
+        force: z.boolean().optional().describe("Take over a live claim held by another agent"),
+      },
+    },
+    async ({ resource, intent, scope, cwd, ttl_seconds, force }) => {
+      const s = scopeOf(scope, cwd);
+      const res = await task.store.claim({
+        scope: s,
+        resource,
+        agentId: task.agentId,
+        agentKind: task.agentKind,
+        intent: intent ?? "",
+        ...(resolveBranch(cwd) ? { branch: resolveBranch(cwd)! } : {}),
+        ...(resolveBaseSha(cwd) ? { baseSha: resolveBaseSha(cwd)! } : {}),
+        ...(ttl_seconds ? { ttlSeconds: ttl_seconds } : {}),
+        force: !!force,
+      });
+      const text = res.ok
+        ? `Claimed ${resource} in ${s}` + (res.reclaimed ? " (refreshed your existing claim)" : "")
+        : `BLOCKED: ${resource} is held by ${res.holder.agentId} (${res.holder.agentKind})` +
+          (res.holder.intent ? ` — "${res.holder.intent}"` : "") +
+          (res.holder.branch ? ` on branch ${res.holder.branch}` : "") +
+          `. Coordinate with them or choose other work.`;
+      return { content: [{ type: "text", text }], structuredContent: { result: res } };
+    },
+  );
+
+  server.registerTool(
+    "task_who",
+    {
+      title: "Who holds this resource",
+      description:
+        "Check whether any agent currently holds a file or area. Cheap and read-only — " +
+        "use it before editing anything you did not claim yourself.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {
+        resource: z.string().describe("Repo-relative path to check"),
+        scope: z.string().optional().describe("Project key; omit to derive from cwd"),
+        cwd: z.string().optional().describe("Checkout directory the resource lives in"),
+      },
+    },
+    async ({ resource, scope, cwd }) => {
+      const holders = await task.store.who(scopeOf(scope, cwd), resource);
+      const others = holders.filter((h) => h.agentId !== task.agentId);
+      const text =
+        holders.length === 0
+          ? `${resource} is unclaimed.`
+          : others.length === 0
+            ? `${resource} is claimed by you.`
+            : others
+                .map(
+                  (h) =>
+                    `${h.resource} held by ${h.agentId} (${h.agentKind})` +
+                    (h.intent ? ` — "${h.intent}"` : ""),
+                )
+                .join("\n");
+      return { content: [{ type: "text", text }], structuredContent: { holders } };
+    },
+  );
+
+  server.registerTool(
+    "task_release",
+    {
+      title: "Release a claim",
+      description:
+        "Finish a claim when your edits are done or abandoned. Reports whether the repo " +
+        "base moved underneath you while you worked, and how many of those commits " +
+        "touched this file — rebase before pushing if it did.",
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+      inputSchema: {
+        resource: z.string().describe("Repo-relative path to release"),
+        status: z.enum(["done", "abandoned"]).optional().describe("Default: done"),
+        note: z.string().optional().describe("What you ended up doing"),
+        scope: z.string().optional().describe("Project key; omit to derive from cwd"),
+        cwd: z.string().optional().describe("Checkout directory the resource lives in"),
+        force: z.boolean().optional().describe("Release a claim held by another agent"),
+      },
+    },
+    async ({ resource, status, note, scope, cwd, force }) => {
+      const released = await task.store.release(scopeOf(scope, cwd), resource, {
+        agentId: task.agentId,
+        status: status ?? "done",
+        ...(note ? { note } : {}),
+        force: !!force,
+      });
+      if (!released) {
+        return {
+          content: [{ type: "text", text: `No live claim of yours on ${resource}.` }],
+          structuredContent: { released: null },
+        };
+      }
+      const drift = describeDrift(released.baseSha ?? undefined, resource, cwd);
+      const text =
+        `Released ${resource} (${released.status}).` +
+        (drift
+          ? ` WARNING: base moved ${drift.commits} commit(s) since you claimed it, ` +
+            `${drift.touching} of them touching this file — rebase before pushing.`
+          : "");
+      return {
+        content: [{ type: "text", text }],
+        structuredContent: { released, drift: drift ?? null },
+      };
+    },
+  );
+
+  server.registerTool(
+    "task_board",
+    {
+      title: "Coordination board",
+      description:
+        "List every live claim in a project — who is working on what, on which branch, " +
+        "since when. Use it at the start of a session to avoid picking up work another " +
+        "agent already has in flight.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {
+        scope: z.string().optional().describe("Project key; omit to derive from cwd"),
+        cwd: z.string().optional().describe("Checkout directory of the project"),
+        include_stale: z.boolean().optional().describe("Also show TTL-lapsed claims"),
+      },
+    },
+    async ({ scope, cwd, include_stale }) => {
+      const s = scopeOf(scope, cwd);
+      const claims = await task.store.list(s, { includeStale: !!include_stale });
+      const text =
+        claims.length === 0
+          ? `No live claims in ${s}.`
+          : `Live claims in ${s}:\n` +
+            claims
+              .map(
+                (c) =>
+                  `- ${c.resource} — ${c.agentId === task.agentId ? "you" : c.agentId}` +
+                  ` (${c.agentKind})${c.branch ? ` on ${c.branch}` : ""}` +
+                  `${c.intent ? `: ${c.intent}` : ""}${c.stale ? " [stale]" : ""}`,
+              )
+              .join("\n");
+      return { content: [{ type: "text", text }], structuredContent: { scope: s, claims } };
+    },
+  );
+
+  server.registerTool(
+    "task_heartbeat",
+    {
+      title: "Extend a claim",
+      description:
+        "Refresh a claim you hold so it does not lapse during long work. A claim whose " +
+        "TTL expires is treated as abandoned and can be taken by another agent.",
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+      inputSchema: {
+        resource: z.string().describe("Repo-relative path you hold"),
+        scope: z.string().optional().describe("Project key; omit to derive from cwd"),
+        cwd: z.string().optional().describe("Checkout directory the resource lives in"),
+      },
+    },
+    async ({ resource, scope, cwd }) => {
+      const ok = await task.store.heartbeat(scopeOf(scope, cwd), resource, task.agentId);
+      return {
+        content: [{ type: "text", text: ok ? `Extended ${resource}.` : `No live claim of yours on ${resource}.` }],
+        structuredContent: { ok },
+      };
     },
   );
 }
@@ -934,7 +1147,8 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
     ...(existsSync(configPath) ? { configPath } : {}),
   });
   const memory = await maybeOpenMemoryBridge();
-  const server = await createMcpServer(store, memory);
+  const task = await maybeOpenTaskBridge();
+  const server = await createMcpServer(store, memory, task);
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
@@ -944,6 +1158,18 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
  * the SQLite-only experience is unchanged. Failures are logged (not fatal) so a
  * misconfigured PG never takes down local document search.
  */
+async function maybeOpenTaskBridge(): Promise<TaskBridge | undefined> {
+  if (!isPgBackend()) return undefined;
+  try {
+    return await openTaskBridge();
+  } catch (err) {
+    // Fail open. Coordination is advisory: an unreachable PG must degrade to
+    // "no coordination", never to "no agent".
+    console.error(`[qmd:mcp] task coordination disabled: ${(err as Error).message}`);
+    return undefined;
+  }
+}
+
 async function maybeOpenMemoryBridge(): Promise<MemoryBridge | undefined> {
   if (!isPgBackend()) return undefined;
   try {
@@ -997,6 +1223,12 @@ export async function startMcpHttpServer(
   // Shared memory bridge (PG backend) — one pool for all sessions.
   const memory = await maybeOpenMemoryBridge();
 
+  // Shared coordination layer. This is the topology the four-client setup wants:
+  // one `qmd mcp --http --daemon` process, one connection pool, and therefore one
+  // consistent view of who holds what across Claude Code / OpenCode / Codex /
+  // Antigravity. See docs/plan/agent-task-coordination.md §8.1.
+  const task = await maybeOpenTaskBridge();
+
   // Session map: each client gets its own McpServer + Transport pair (MCP spec requirement).
   // The store is shared — it's stateless SQLite, safe for concurrent access.
   const sessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
@@ -1010,7 +1242,7 @@ export async function startMcpHttpServer(
         log(`${ts()} New session ${sessionId} (${sessions.size} active)`);
       },
     });
-    const server = await createMcpServer(store, memory);
+    const server = await createMcpServer(store, memory, task);
     await server.connect(transport);
 
     transport.onclose = () => {

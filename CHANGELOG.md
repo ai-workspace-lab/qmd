@@ -4,6 +4,26 @@
 
 ### Changes
 
+- Coordination: add a **multi-agent task coordination layer** on top of the PG
+  backend, so agents working the same repository from different clients can see
+  what the others already have in flight instead of colliding on it.
+  - CLI: `qmd task claim|who|release|heartbeat|ls|history|scopes|status`.
+  - MCP: when `QMD_BACKEND=pg`, `qmd mcp` also exposes `task_claim`,
+    `task_who`, `task_release`, `task_board`, and `task_heartbeat`.
+  - Mutual exclusion is a PostgreSQL partial unique index (one `active` claim
+    per `scope` + `resource`), not an application-level convention; concurrent
+    claims serialise on it and the losers are told who actually won.
+  - Claims carry a TTL and are expired lazily on the next claim, so a crashed
+    session cannot hold a resource forever and no `pg_cron` job is required.
+  - Claims are **advisory**: only Claude Code and Antigravity can enforce a
+    pre-write hook, so a missed claim must cost coordination benefit only,
+    never correctness. Nothing blocks on the coordination layer, and an
+    unreachable PostgreSQL degrades to "no coordination" rather than "no agent".
+  - `scope` is derived from the git remote (SSH and HTTPS clones normalise to
+    the same key); `release` reports whether the base drifted while you worked
+    and how many of those commits touched the file.
+  - Needs neither pgvector nor an embedder — claims are structured rows, not
+    semantic memory. See `docs/plan/agent-task-coordination.md`.
 - Backend: add an optional **PostgreSQL memory bridge** so qmd can act as a
   shared, namespaced, persistent memory store for external agents (OpenClaw,
   Hermes, …) on top of `pgvector` + `pg_jieba` + `pg_trgm` (e.g. the
