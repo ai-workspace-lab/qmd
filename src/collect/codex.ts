@@ -16,6 +16,75 @@ import { readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isoOr, readJsonlFrom, type SessionFacts, type SessionFile, type SessionSource } from "./types.js";
+import Database from "better-sqlite3";
+
+export interface CodexPinnedTask {
+  id: string;
+  name: string;
+  title: string;
+  cwd: string;
+  gitBranch?: string;
+  updatedAt: string;
+  position: number;
+  projectName?: string;
+}
+
+export interface CodexProject {
+  id: string;
+  name: string;
+  path: string;
+}
+
+export function readCodexState(home = homedir()): { pinned: CodexPinnedTask[]; projects: CodexProject[] } {
+  const dbPath = join(home, ".codex", "state_5.sqlite");
+  if (!existsSync(dbPath)) return { pinned: [], projects: [] };
+
+  try {
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      const projects: CodexProject[] = db.prepare(`
+        SELECT p.id, p.name, pr.path
+        FROM projects p
+        JOIN project_roots pr ON p.id = pr.project_id
+        ORDER BY LENGTH(pr.path) DESC
+      `).all() as any;
+
+      const pinnedRows = db.prepare(`
+        SELECT t.id, t.name, t.title, t.cwd, t.git_branch, t.updated_at_ms, t.section_position
+        FROM threads t
+        JOIN thread_sections s ON t.thread_section_id = s.id
+        WHERE s.name = 'Pinned' OR t.is_pinned = 1
+        ORDER BY t.section_position ASC
+      `).all() as any[];
+
+      const pinned: CodexPinnedTask[] = pinnedRows.map((t, idx) => {
+        const match = projects.find(
+          (p) =>
+            t.cwd === p.path ||
+            t.cwd?.startsWith(p.path + "/") ||
+            t.cwd?.endsWith("/" + p.name) ||
+            t.cwd?.includes("/" + p.name + "/"),
+        );
+        return {
+          id: t.id,
+          name: t.name || (t.title ? t.title.slice(0, 60) : "Untitled"),
+          title: t.title || t.name || "",
+          cwd: t.cwd,
+          gitBranch: t.git_branch || undefined,
+          updatedAt: new Date(t.updated_at_ms || Date.now()).toISOString(),
+          position: typeof t.section_position === "number" ? t.section_position : idx,
+          projectName: match ? match.name : undefined,
+        };
+      });
+
+      return { pinned, projects };
+    } finally {
+      db.close();
+    }
+  } catch {
+    return { pinned: [], projects: [] };
+  }
+}
 
 export function codexDirs(home = homedir()): string[] {
   return [join(home, ".codex", "sessions"), join(home, ".codex", "archived_sessions")];

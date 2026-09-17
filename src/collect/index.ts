@@ -8,11 +8,15 @@
  */
 
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { PgContextStore } from "../pg/context-store.js";
 import { findSecret } from "./redact.js";
 import { extractSession } from "./extract.js";
 import { claudeCodeSource, claudeDesktopSource } from "./claude-code.js";
-import { codexSource } from "./codex.js";
+import { codexSource, readCodexState } from "./codex.js";
 import { antigravitySource } from "./antigravity.js";
 import { opencodeSource } from "./opencode.js";
 import type { SessionSource } from "./types.js";
@@ -57,6 +61,60 @@ function threadLabel(scope: string, branch?: string, pr?: number): string {
   return pr ? `${scope}#${pr}` : `${scope}@${branch ?? "?"}`;
 }
 
+async function syncAppCatalogs(store: PgContextStore): Promise<void> {
+  // 1. Codex state (projects & pinned tasks)
+  try {
+    const codexState = readCodexState();
+    if (codexState.projects.length > 0) {
+      await store.upsertSharedProjects(
+        codexState.projects.map((p) => ({
+          id: p.id,
+          name: p.name,
+          rootPath: p.path,
+          source: "codex",
+        })),
+      );
+    }
+    if (codexState.pinned.length > 0) {
+      await store.upsertPinnedTasks(
+        codexState.pinned.map((p) => ({
+          id: p.id,
+          source: "codex",
+          title: p.name,
+          cwd: p.cwd,
+          projectName: p.projectName,
+          gitBranch: p.gitBranch,
+          position: p.position,
+          updatedAt: p.updatedAt,
+        })),
+      );
+    }
+  } catch {
+    // Ignore error reading codex state
+  }
+
+  // 2. Claude projects from ~/.claude.json
+  try {
+    const claudeJsonPath = join(homedir(), ".claude.json");
+    if (existsSync(claudeJsonPath)) {
+      const content = JSON.parse(await readFile(claudeJsonPath, "utf8"));
+      if (content.projects && typeof content.projects === "object") {
+        const claudeProjects = Object.keys(content.projects).map((rootPath) => ({
+          id: `claude:${rootPath.split("/").pop() || "project"}`,
+          name: rootPath.split("/").pop() || "project",
+          rootPath,
+          source: "claude",
+        }));
+        if (claudeProjects.length > 0) {
+          await store.upsertSharedProjects(claudeProjects);
+        }
+      }
+    }
+  } catch {
+    // Ignore error reading claude json
+  }
+}
+
 export async function runCollect(opts: CollectOptions): Promise<CollectReport> {
   const report: CollectReport = {
     files: 0,
@@ -70,6 +128,10 @@ export async function runCollect(opts: CollectOptions): Promise<CollectReport> {
   const skip = (reason: string) => {
     report.skipped[reason] = (report.skipped[reason] ?? 0) + 1;
   };
+
+  if (opts.store && !opts.dryRun) {
+    await syncAppCatalogs(opts.store);
+  }
 
   const selected = SOURCES.filter(
     (s) => s.implemented && s.detect() && (!opts.sources?.length || opts.sources.includes(s.id)),

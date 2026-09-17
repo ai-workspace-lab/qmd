@@ -46,6 +46,7 @@ import {
 } from "../pg/index.js";
 import { registerContextTools } from "./context-tools.js";
 import { handleAgentIngest, INGEST_PATH } from "./agent-ingest.js";
+import { handleAgentCatalog, CATALOG_PATH } from "./agent-catalog.js";
 
 enableProductionMode();
 
@@ -1055,6 +1056,12 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
       if (pathname === INGEST_PATH || pathname.startsWith(`${INGEST_PATH}?`)) {
         await handleAgentIngest(nodeReq, nodeRes, context, ingestToken);
         log(`${ts()} ${nodeReq.method} ${INGEST_PATH} ${nodeRes.statusCode} (${Date.now() - reqStart}ms)`);
+        return;
+      }
+
+      if (pathname === CATALOG_PATH || pathname.startsWith(`${CATALOG_PATH}?`)) {
+        await handleAgentCatalog(nodeReq, nodeRes, context, ingestToken);
+        log(`${ts()} ${nodeReq.method} ${CATALOG_PATH} ${nodeRes.statusCode} (${Date.now() - reqStart}ms)`);
         return;
       }
 
