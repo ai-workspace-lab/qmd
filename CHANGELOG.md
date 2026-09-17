@@ -4,6 +4,29 @@
 
 ### Changes
 
+- Context: add a **shared task context** layer so Claude Code, Codex,
+  Antigravity (and later OpenCode, web and mobile clients) can pick up the same
+  PR/branch task where another client left it.
+  - One *thread* per PR (else per branch); sessions from every client attach to
+    it and contribute keyed items — goal, next action, plan steps, decisions,
+    pitfalls, verification results, repo-relative paths, questions, blockers.
+  - Items merge by deterministic field rules (plan progress only moves
+    forward, verification on the current head wins, identical pitfalls
+    collapse with per-client attribution). Goal / next action belong to the
+    session holding the driver lease; anyone else's become proposals, so a
+    stale session can never overwrite the handoff.
+  - `qmd ctx collect` reads local session directories incrementally —
+    `~/.claude/projects`, Claude Desktop session metadata (titles, linked PRs),
+    `~/.codex/sessions`, `~/.gemini/antigravity` — and extracts only important
+    facts by rule. Message text, tool output, diffs, absolute paths and
+    anything that looks like a credential are never stored. OpenCode is
+    detected but not parsed yet.
+  - CLI: `qmd ctx sources|collect|threads|brief|note|lead|handoff`.
+  - MCP: `task_resume`, `task_note`, `task_handoff`.
+  - HTTP: write-only `POST /api/v1/agent/ingest` (Bearer `QMD_INGEST_TOKEN`) for
+    xworkmate-bridge to forward web/mobile contributions.
+  - Schema `qmd_ctx_*` needs neither pgvector nor an embedder. See
+    `docs/plan/multi-agent-shared-context.md`.
 - Coordination: add a **multi-agent task coordination layer** on top of the PG
   backend, so agents working the same repository from different clients can see
   what the others already have in flight instead of colliding on it.

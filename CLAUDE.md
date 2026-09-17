@@ -168,6 +168,26 @@ task_heartbeat`. With one shared `qmd mcp --http --daemon`, pass `scope` or
 Design: `docs/plan/agent-task-coordination.md`. Code: `src/pg/task-store.ts`,
 `src/pg/task-scope.ts`.
 
+## Shared task context (PG backend, optional)
+
+Threads keyed by PR (else branch) that every agent client contributes to, so a
+task started in one client can be resumed in another. Stores only important
+session facts — never file contents, diffs, logs, absolute paths or secrets.
+
+```sh
+qmd ctx sources                         # local session dirs this machine has
+qmd ctx collect --since 3d --dry-run    # preview what would be extracted
+qmd ctx collect --since 3d              # extract into threads (incremental)
+qmd ctx threads | brief [--thread id]   # list / merged handoff briefing
+qmd ctx note pitfall "…" | lead | handoff --next "…"
+```
+
+MCP: `task_resume`, `task_note`, `task_handoff` (pass `cwd`). HTTP daemon also
+serves write-only `POST /api/v1/agent/ingest` when `QMD_INGEST_TOKEN` is set.
+Code: `src/pg/context-*.ts`, `src/collect/`, `src/mcp/context-tools.ts`,
+`src/mcp/agent-ingest.ts`. Collectors only ever read client session
+directories; never modify them.
+
 ## Development
 
 ```sh
@@ -199,6 +219,8 @@ bun test --preload ./src/test-preload.ts test/
 - Never modify the SQLite database directly
 - Write out example commands for the user to run manually
 - Index is stored at `~/.cache/qmd/index.sqlite`
+- On this machine, always run CLI commands via `npx tsx src/cli/qmd.ts`, NOT `bin/qmd` (prevents bun.lock detection failure when node ABI is used)
+- Always require user confirmation before installing system daemons, editing client configs, or pushing git branches
 
 ## Do NOT compile
 
