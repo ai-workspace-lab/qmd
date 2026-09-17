@@ -192,4 +192,66 @@ export function registerContextTools(server: McpServer, ctx: ContextBridge, fall
       };
     },
   );
+
+  server.registerTool(
+    "task_catalog",
+    {
+      title: "Get shared task catalog, pinned tasks, and project directories",
+      description:
+        "Returns the unified catalog across Codex, Claude Code, Antigravity, and OpenCode: " +
+        "1. Pinned tasks (置顶任务, e.g. from Codex Desktop). " +
+        "2. Shared project directories and workspaces. " +
+        "3. Active resource leases and locks across agents. " +
+        "4. Recent active task threads. " +
+        "Use this tool to discover tasks or projects to resume, or to check which agent is working on what.",
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+      inputSchema: {
+        cwd: z.string().optional().describe("Current working directory to filter or highlight relative tasks"),
+      },
+    },
+    async ({ cwd }) => {
+      const catalog = await store.getCatalog(cwd);
+
+      let text = `# Shared Task & Project Catalog\n\n`;
+
+      text += `## 📌 Pinned Tasks (置顶任务 - ${catalog.pinnedTasks.length})\n`;
+      if (catalog.pinnedTasks.length === 0) {
+        text += `*(No pinned tasks)*\n\n`;
+      } else {
+        for (const [idx, t] of catalog.pinnedTasks.entries()) {
+          const proj = t.projectName ? ` [${t.projectName}]` : "";
+          const branch = t.gitBranch ? ` (${t.gitBranch})` : "";
+          const dir = t.cwd ? ` \`${t.cwd}\`` : "";
+          text += `${idx + 1}. **${t.title}**${proj}${branch}\n   Source: \`${t.source}\` | Path: ${dir || "n/a"}\n`;
+        }
+        text += "\n";
+      }
+
+      text += `## 📁 Shared Projects (共享项目 - ${catalog.sharedProjects.length})\n`;
+      if (catalog.sharedProjects.length === 0) {
+        text += `*(No shared projects)*\n\n`;
+      } else {
+        for (const p of catalog.sharedProjects) {
+          text += `- **${p.name}**: \`${p.rootPath}\` (sources: ${p.sources.join(", ")})\n`;
+        }
+        text += "\n";
+      }
+
+      text += `## 🔒 Active In-Flight Leases (正在执行中 - ${catalog.activeClaims.length})\n`;
+      if (catalog.activeClaims.length === 0) {
+        text += `*(No active resource locks)*\n\n`;
+      } else {
+        for (const c of catalog.activeClaims) {
+          text += `- \`${c.resource}\` held by ${c.agentKind} (\`${c.agentId}\`)${c.intent ? ` for "${c.intent}"` : ""} (expires: ${c.expiresAt})\n`;
+        }
+        text += "\n";
+      }
+
+      return {
+        content: [{ type: "text", text }],
+        structuredContent: catalog,
+      };
+    },
+  );
 }
+

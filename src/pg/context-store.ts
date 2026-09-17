@@ -94,6 +94,40 @@ export interface Briefing {
   events: Array<{ seq: number; type: string; createdAt: string; payload: Record<string, unknown> }>;
 }
 
+export interface SharedProject {
+  id: string;
+  name: string;
+  rootPath: string;
+  sources: string[];
+  updatedAt: string;
+}
+
+export interface PinnedTask {
+  id: string;
+  source: string;
+  title: string;
+  cwd?: string;
+  projectName?: string;
+  gitBranch?: string;
+  position: number;
+  updatedAt: string;
+}
+
+export interface TaskCatalog {
+  [key: string]: unknown;
+  pinnedTasks: PinnedTask[];
+  sharedProjects: SharedProject[];
+  activeClaims: Array<{
+    resource: string;
+    agentId: string;
+    agentKind: string;
+    intent: string;
+    expiresAt: string;
+    threadId?: string;
+  }>;
+  recentThreads: ContextThread[];
+}
+
 /** Branch names too broad to identify a piece of work on their own. */
 const DEFAULT_BRANCHES = new Set(["main", "master", "trunk", "HEAD"]);
 
@@ -690,6 +724,119 @@ export class PgContextStore {
         createdAt: new Date(e.created_at).toISOString(),
         payload: e.payload,
       })),
+    };
+  }
+
+  // ── Pinned tasks & Shared projects catalog ─────────────────────────────
+
+  async upsertSharedProjects(
+    projects: Array<{ id: string; name: string; rootPath: string; source: string }>,
+  ): Promise<void> {
+    for (const p of projects) {
+      await this.client.exec(
+        `INSERT INTO qmd_shared_project (id, name, root_path, sources, updated_at)
+         VALUES ($1, $2, $3, ARRAY[$4]::text[], now())
+         ON CONFLICT (root_path) DO UPDATE
+           SET name = EXCLUDED.name,
+               sources = ARRAY(SELECT DISTINCT UNNEST(qmd_shared_project.sources || EXCLUDED.sources)),
+               updated_at = now()`,
+        [p.id, p.name, p.rootPath, p.source],
+      );
+    }
+  }
+
+  async upsertPinnedTasks(tasks: PinnedTask[]): Promise<void> {
+    for (const t of tasks) {
+      await this.client.exec(
+        `INSERT INTO qmd_pinned_task (id, source, title, cwd, project_name, git_branch, position, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (id) DO UPDATE
+           SET source = EXCLUDED.source,
+               title = EXCLUDED.title,
+               cwd = EXCLUDED.cwd,
+               project_name = EXCLUDED.project_name,
+               git_branch = EXCLUDED.git_branch,
+               position = EXCLUDED.position,
+               updated_at = EXCLUDED.updated_at`,
+        [
+          t.id,
+          t.source,
+          t.title,
+          t.cwd ?? null,
+          t.projectName ?? null,
+          t.gitBranch ?? null,
+          t.position ?? 0,
+          t.updatedAt ?? new Date().toISOString(),
+        ],
+      );
+    }
+  }
+
+  async listSharedProjects(): Promise<SharedProject[]> {
+    const rows = await this.client.query<any>(
+      `SELECT id, name, root_path, sources, updated_at FROM qmd_shared_project ORDER BY name ASC`,
+    );
+    return rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      rootPath: r.root_path,
+      sources: r.sources ?? [],
+      updatedAt: new Date(r.updated_at).toISOString(),
+    }));
+  }
+
+  async listPinnedTasks(source?: string): Promise<PinnedTask[]> {
+    const sql = source
+      ? `SELECT id, source, title, cwd, project_name, git_branch, position, updated_at
+         FROM qmd_pinned_task WHERE source = $1 ORDER BY position ASC, updated_at DESC`
+      : `SELECT id, source, title, cwd, project_name, git_branch, position, updated_at
+         FROM qmd_pinned_task ORDER BY position ASC, updated_at DESC`;
+    const rows = await this.client.query<any>(sql, source ? [source] : []);
+    return rows.map((r) => ({
+      id: r.id,
+      source: r.source,
+      title: r.title,
+      cwd: r.cwd ?? undefined,
+      projectName: r.project_name ?? undefined,
+      gitBranch: r.git_branch ?? undefined,
+      position: Number(r.position),
+      updatedAt: new Date(r.updated_at).toISOString(),
+    }));
+  }
+
+  async getCatalog(_cwd?: string): Promise<TaskCatalog> {
+    const pinnedTasks = await this.listPinnedTasks();
+    const sharedProjects = await this.listSharedProjects();
+
+    const activeClaimsRaw = await this.client.query<any>(
+      `SELECT resource, agent_id, agent_kind, intent, thread_id,
+              (heartbeat_at + make_interval(secs => ttl_seconds)) AS expires_at
+       FROM qmd_task_claim
+       WHERE status = 'active' AND heartbeat_at > now() - make_interval(secs => ttl_seconds)
+       ORDER BY claimed_at DESC`,
+    );
+    const activeClaims = activeClaimsRaw.map((c) => ({
+      resource: c.resource,
+      agentId: c.agent_id,
+      agentKind: c.agent_kind,
+      intent: c.intent,
+      expiresAt: new Date(c.expires_at).toISOString(),
+      threadId: c.thread_id ?? undefined,
+    }));
+
+    const recentRows = await this.client.query<any>(
+      `SELECT ${THREAD_COLUMNS}
+       FROM qmd_ctx_thread
+       WHERE state IN ${LIVE_STATES}
+       ORDER BY updated_at DESC LIMIT 20`,
+    );
+    const recentThreads = recentRows.map(toThread);
+
+    return {
+      pinnedTasks,
+      sharedProjects,
+      activeClaims,
+      recentThreads,
     };
   }
 

@@ -368,4 +368,28 @@ export async function bootstrapContextSchema(client: PgClient): Promise<void> {
   `);
 
   await client.exec(`ALTER TABLE qmd_task_claim ADD COLUMN IF NOT EXISTS thread_id uuid`);
+
+  await client.exec(`
+    CREATE TABLE IF NOT EXISTS qmd_shared_project (
+      id           text PRIMARY KEY,
+      name         text NOT NULL,
+      root_path    text NOT NULL UNIQUE,
+      sources      text[] NOT NULL DEFAULT '{}',
+      updated_at   timestamptz NOT NULL DEFAULT now()
+    )
+  `);
+
+  await client.exec(`
+    CREATE TABLE IF NOT EXISTS qmd_pinned_task (
+      id           text PRIMARY KEY,
+      source       text NOT NULL,
+      title        text NOT NULL,
+      cwd          text,
+      project_name text,
+      git_branch   text,
+      position     integer NOT NULL DEFAULT 0,
+      updated_at   timestamptz NOT NULL DEFAULT now()
+    )
+  `);
+  await tryExec(client, `CREATE INDEX IF NOT EXISTS qmd_pinned_task_pos ON qmd_pinned_task (position ASC, updated_at DESC)`);
 }
