@@ -264,3 +264,38 @@ describe("extraction", () => {
     rmSync(parent, { recursive: true, force: true });
   });
 });
+
+describe("heredoc bodies are never mistaken for verification commands", () => {
+  test("a heredoc that writes a fixture mentioning 'go test' is not a verification", () => {
+    const command = [
+      "cat > test/fixture.ts <<'EOF2'",
+      'const cmd = { command: ["/bin/zsh", "-lc", "go test ./..."], exit_code: 0 };',
+      "EOF2",
+    ].join("\n");
+    expect(verificationSegment(command)).toBeUndefined();
+  });
+
+  test("a real command after a heredoc is still detected", () => {
+    const command = [
+      "cat > file.txt <<'EOF2'",
+      "some content mentioning go test but not run",
+      "EOF2",
+      "go test ./...",
+    ].join("\n");
+    expect(verificationSegment(command)).toBe("go test ./...");
+  });
+});
+
+describe("only commands that run a check count as verification", () => {
+  test.each([
+    ['git commit -m "fix\n\n- `npm test`\n- `terraform validate`"', undefined],
+    ['echo \'{ "cmd": "go test ./...", "result": "pass" }\'', undefined],
+    ["go test ./...`, exitCode: 0 }],", undefined],
+    ["grep -n 'go test' Makefile", undefined],
+    ["env -u QMD_MCP_TOKEN -u QMD_BACKEND npx vitest run test/mcp.test.ts", "env -u QMD_MCP_TOKEN -u QMD_BACKEND npx vitest run test/mcp.test.ts"],
+    ["CI=1 go test ./internal/acp/", "CI=1 go test ./internal/acp/"],
+    ["cd bridge && time make test", "time make test"],
+  ])("%s", (command, expected) => {
+    expect(verificationSegment(command)).toBe(expected);
+  });
+});

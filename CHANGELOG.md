@@ -4,6 +4,26 @@
 
 ### Changes
 
+- Context: **two-way sync for every client through xworkmate-bridge**.
+  - Read routes (bearer `QMD_INGEST_TOKEN`, paged, max 200 per page):
+    `GET /api/v1/agent/catalog`, `/threads`, `/threads/{id}/briefing`,
+    `/memory` (lexical search over merged thread items and `qmd_memory`), and
+    `/sync?cursor=` — a global change feed over threads, items, pinned tasks and
+    shared projects, paged by `(xid8, sequence)` below `pg_snapshot_xmin` so a
+    slow concurrent writer can never commit behind a consumer's cursor.
+  - Catalog rows no longer carry absolute paths: locations are a git scope plus
+    repo-relative path, a ChatGPT/Codex cloud project ref, or a directory name.
+    Legacy rows are dropped by the migration and rebuilt by the next
+    `qmd ctx collect`; unpinned tasks and removed projects are tombstoned.
+  - Remote mode: with `QMD_MCP_TOKEN` set, `/mcp` and `/query` require the
+    bearer, and a daemon bound beyond loopback refuses to start without it.
+    `task_resume` / `task_note` / `task_handoff` / `task_claim` accept explicit
+    `scope` / `branch` / `head_sha` and refuse to guess a scope from a `cwd`
+    that does not exist on the QMD host.
+  - Collectors: verification commands must be the command word of a segment
+    (heredoc bodies, multi-line commit messages and JSON snippets no longer
+    count).
+  - PG integration tests delete the rows they create.
 - Context: add a **shared task context** layer so Claude Code, Codex,
   Antigravity (and later OpenCode, web and mobile clients) can pick up the same
   PR/branch task where another client left it.

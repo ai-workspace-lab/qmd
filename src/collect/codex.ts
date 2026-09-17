@@ -35,9 +35,11 @@ export interface CodexProject {
   path: string;
 }
 
-export function readCodexState(home = homedir()): { pinned: CodexPinnedTask[]; projects: CodexProject[] } {
+export function readCodexState(
+  home = homedir(),
+): { ok: boolean; pinned: CodexPinnedTask[]; projects: CodexProject[] } {
   const dbPath = join(home, ".codex", "state_5.sqlite");
-  if (!existsSync(dbPath)) return { pinned: [], projects: [] };
+  if (!existsSync(dbPath)) return { ok: false, pinned: [], projects: [] };
 
   try {
     const db = new Database(dbPath, { readonly: true });
@@ -77,12 +79,12 @@ export function readCodexState(home = homedir()): { pinned: CodexPinnedTask[]; p
         };
       });
 
-      return { pinned, projects };
+      return { ok: true, pinned, projects };
     } finally {
       db.close();
     }
   } catch {
-    return { pinned: [], projects: [] };
+    return { ok: false, pinned: [], projects: [] };
   }
 }
 
