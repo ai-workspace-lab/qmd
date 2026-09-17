@@ -12,7 +12,8 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { PgContextStore } from "../pg/context-store.js";
+import type { PgContextStore, SharedProjectInput } from "../pg/context-store.js";
+import { describeLocation } from "./location.js";
 import { findSecret } from "./redact.js";
 import { extractSession } from "./extract.js";
 import { claudeCodeSource, claudeDesktopSource } from "./claude-code.js";
@@ -61,57 +62,58 @@ function threadLabel(scope: string, branch?: string, pr?: number): string {
   return pr ? `${scope}#${pr}` : `${scope}@${branch ?? "?"}`;
 }
 
+/**
+ * Mirror each app's own pinned tasks and project list into the shared catalog.
+ * Locations are converted to git scope + repo-relative path before they leave
+ * this machine. A source is only reconciled (and its removals tombstoned) when
+ * its state could actually be read — an unreadable database must not look like
+ * "the user unpinned everything".
+ */
 async function syncAppCatalogs(store: PgContextStore): Promise<void> {
-  // 1. Codex state (projects & pinned tasks)
-  try {
-    const codexState = readCodexState();
-    if (codexState.projects.length > 0) {
-      await store.upsertSharedProjects(
-        codexState.projects.map((p) => ({
-          id: p.id,
-          name: p.name,
-          rootPath: p.path,
-          source: "codex",
-        })),
-      );
+  const codex = readCodexState();
+  if (codex.ok) {
+    const projects = new Map<string, SharedProjectInput>();
+    for (const p of codex.projects) {
+      const loc = describeLocation(p.path);
+      projects.set(loc.key, { ...loc, name: p.name, source: "codex" });
     }
-    if (codexState.pinned.length > 0) {
-      await store.upsertPinnedTasks(
-        codexState.pinned.map((p) => ({
-          id: p.id,
+    await store.syncSharedProjects("codex", [...projects.values()]);
+    await store.syncPinnedTasks(
+      "codex",
+      codex.pinned.map((t) => {
+        const loc = t.cwd ? describeLocation(t.cwd) : undefined;
+        return {
+          id: t.id,
           source: "codex",
-          title: p.name,
-          cwd: p.cwd,
-          projectName: p.projectName,
-          gitBranch: p.gitBranch,
-          position: p.position,
-          updatedAt: p.updatedAt,
-        })),
-      );
-    }
-  } catch {
-    // Ignore error reading codex state
+          title: t.name,
+          scope: loc?.scope ?? null,
+          location: loc?.location ?? null,
+          ...(t.projectName ? { projectName: t.projectName } : {}),
+          ...(t.gitBranch ? { gitBranch: t.gitBranch } : {}),
+          position: t.position,
+          updatedAt: t.updatedAt,
+        };
+      }),
+    );
   }
 
-  // 2. Claude projects from ~/.claude.json
-  try {
-    const claudeJsonPath = join(homedir(), ".claude.json");
-    if (existsSync(claudeJsonPath)) {
-      const content = JSON.parse(await readFile(claudeJsonPath, "utf8"));
-      if (content.projects && typeof content.projects === "object") {
-        const claudeProjects = Object.keys(content.projects).map((rootPath) => ({
-          id: `claude:${rootPath.split("/").pop() || "project"}`,
-          name: rootPath.split("/").pop() || "project",
-          rootPath,
-          source: "claude",
-        }));
-        if (claudeProjects.length > 0) {
-          await store.upsertSharedProjects(claudeProjects);
-        }
-      }
+  const claudeJsonPath = join(homedir(), ".claude.json");
+  if (existsSync(claudeJsonPath)) {
+    let content: any;
+    try {
+      content = JSON.parse(await readFile(claudeJsonPath, "utf8"));
+    } catch {
+      return; // being rewritten by Claude Code right now; try again next collect
     }
-  } catch {
-    // Ignore error reading claude json
+    if (content?.projects && typeof content.projects === "object") {
+      const projects = new Map<string, SharedProjectInput>();
+      for (const rootPath of Object.keys(content.projects)) {
+        if (!existsSync(rootPath)) continue;
+        const loc = describeLocation(rootPath);
+        projects.set(loc.key, { ...loc, name: loc.label, source: "claude" });
+      }
+      await store.syncSharedProjects("claude", [...projects.values()]);
+    }
   }
 }
 

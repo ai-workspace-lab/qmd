@@ -15,7 +15,7 @@ import { resolveScope, resolveAgentId, resolveAgentKind } from "./task-scope.js"
 
 export { PgMemoryStore } from "./memory-store.js";
 export { PgTaskStore } from "./task-store.js";
-export { PgContextStore } from "./context-store.js";
+export { PgContextStore, clampPage, decodeSyncCursor, encodeSyncCursor } from "./context-store.js";
 export type { ContextThread, Briefing, BriefingItem, MergeResult, ResolveInput } from "./context-store.js";
 export type { IncomingItem, ItemKind } from "./context-merge.js";
 export { ITEM_KINDS } from "./context-merge.js";

@@ -392,4 +392,78 @@ export async function bootstrapContextSchema(client: PgClient): Promise<void> {
     )
   `);
   await tryExec(client, `CREATE INDEX IF NOT EXISTS qmd_pinned_task_pos ON qmd_pinned_task (position ASC, updated_at DESC)`);
+
+  await bootstrapShareableCatalog(client);
+  await bootstrapChangeFeed(client);
+}
+
+/**
+ * Catalog rows carry no absolute paths (docs/plan/multi-agent-shared-context.md
+ * §2): a location is a git scope + repo-relative path, a cloud project ref, or
+ * a directory name. Rows written before this migration held absolute paths and
+ * are dropped; the next `qmd ctx collect` recreates them in the new shape.
+ * Removed pins/projects are tombstoned (removed_at) so sync consumers see them go.
+ */
+async function bootstrapShareableCatalog(client: PgClient): Promise<void> {
+  await client.tx(async (tx) => {
+    await tx.query(`SELECT pg_advisory_xact_lock(hashtext('qmd_ctx_catalog_migration'))`);
+    await tx.exec(`
+      ALTER TABLE qmd_shared_project
+        ADD COLUMN IF NOT EXISTS project_key text,
+        ADD COLUMN IF NOT EXISTS kind text,
+        ADD COLUMN IF NOT EXISTS scope text,
+        ADD COLUMN IF NOT EXISTS location text,
+        ADD COLUMN IF NOT EXISTS removed_at timestamptz
+    `);
+    await tx.exec(`ALTER TABLE qmd_shared_project ALTER COLUMN root_path DROP NOT NULL`);
+    await tx.exec(`DELETE FROM qmd_shared_project WHERE project_key IS NULL`);
+    await tx.exec(
+      `CREATE UNIQUE INDEX IF NOT EXISTS qmd_shared_project_key_uniq ON qmd_shared_project (project_key)`,
+    );
+    await tx.exec(`
+      ALTER TABLE qmd_pinned_task
+        ADD COLUMN IF NOT EXISTS scope text,
+        ADD COLUMN IF NOT EXISTS location text,
+        ADD COLUMN IF NOT EXISTS removed_at timestamptz
+    `);
+    await tx.exec(`DELETE FROM qmd_pinned_task WHERE location IS NULL`);
+    await tx.exec(`UPDATE qmd_pinned_task SET cwd = NULL WHERE cwd IS NOT NULL`);
+  });
+}
+
+/** Tables whose changes are published through GET /api/v1/agent/sync. */
+export const CHANGE_FEED_TABLES = ["qmd_ctx_thread", "qmd_ctx_item", "qmd_pinned_task", "qmd_shared_project"] as const;
+
+/**
+ * Global change feed for two-way sync. Every insert/update stamps the row with
+ * the writing transaction id (xid8) and a sequence number. Readers page by
+ * (change_xid, change_seq) and only past pg_snapshot_xmin: every transaction
+ * below xmin has finished, so no row can later appear behind the cursor.
+ */
+async function bootstrapChangeFeed(client: PgClient): Promise<void> {
+  await client.tx(async (tx) => {
+    await tx.query(`SELECT pg_advisory_xact_lock(hashtext('qmd_ctx_change_feed_migration'))`);
+    await tx.exec(`CREATE SEQUENCE IF NOT EXISTS qmd_ctx_change_seq`);
+    await tx.exec(`
+      CREATE OR REPLACE FUNCTION qmd_ctx_stamp_change() RETURNS trigger LANGUAGE plpgsql AS $fn$
+      BEGIN
+        NEW.change_seq := nextval('qmd_ctx_change_seq');
+        NEW.change_xid := pg_current_xact_id();
+        RETURN NEW;
+      END
+      $fn$
+    `);
+    for (const table of CHANGE_FEED_TABLES) {
+      await tx.exec(
+        `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS change_seq bigint, ADD COLUMN IF NOT EXISTS change_xid xid8`,
+      );
+      await tx.exec(`DROP TRIGGER IF EXISTS qmd_ctx_change ON ${table}`);
+      await tx.exec(
+        `CREATE TRIGGER qmd_ctx_change BEFORE INSERT OR UPDATE ON ${table}
+           FOR EACH ROW EXECUTE FUNCTION qmd_ctx_stamp_change()`,
+      );
+      await tx.exec(`UPDATE ${table} SET change_seq = change_seq WHERE change_seq IS NULL`);
+      await tx.exec(`CREATE INDEX IF NOT EXISTS ${table}_change_idx ON ${table} (change_xid, change_seq)`);
+    }
+  });
 }

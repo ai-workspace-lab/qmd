@@ -6,7 +6,10 @@
 > **架构定型决策（2026-09-17）**  
 > 1. **QMD 即协调服务**：废除早期“独立 Go 协调服务 / Bridge 持有 Schema”方案。QMD 是 task-coordination 协调服务本身，直连 PostgreSQL，持有统一 Schema（`src/pg/schema-pg.ts` 的 `qmd_ctx_*` 表）。  
 > 2. **本地原生目录为第一数据源**：以 Desktop / CLI 在本机可读的会话目录为主，由 QMD daemon 按规则增量抽取高价值事实写入 PG。  
-> 3. **Bridge 严守单向网关**：xworkmate-bridge 仅负责将网页端/移动端插件数据以 `POST /api/v1/agent/ingest` 单向提交给 QMD，不存数据、不持有 Schema、不提供读接口。  
+> 3. **所有客户端都经 bridge 双向访问，Bridge 自身始终无状态**（2026-09-17 再次修正）：
+>    - **网页 / 移动端**（ChatGPT、Claude 网页与手机端扩展）与 **CLI / APP 端**（Claude Code CLI/Desktop、Codex CLI/Desktop、Antigravity、OpenCode 的扩展插件）**一视同仁**：都能经 `bridge → QMD（PgTaskStore）→ PostgreSQL` **获取**任务、任务列表与共享记忆，也都能经 ingest **提交**会话事实。
+>    - **两类客户端都通过插件实现双向同步**：网页 / 移动端用浏览器或应用扩展，CLI / APP 端用各自的扩展插件；插件负责推送（ingest）与拉取（读路由 / sync 游标），同步协议见 §7.3。
+>    - Bridge 不存数据、不持有 Schema、不做合并，合并规则只在 QMD；bridge 只负责鉴权、白名单路由、令牌置换与大小上限。  
 > 4. **只承载重要会话事实，坚决不承载制品**：每个条目 body 严格 $\le$ 4 KiB，严格杜绝源码、Diff 与原始测试日志。  
 > 5. **同一 Git PR / 分支的任务合并为一个线程（Thread）**：规则确定性合并，纯函数状态机治理，LLM 留作后续可选扩展。  
 
@@ -32,21 +35,21 @@
 
 ```
  T0 本地原生会话 (主数据源)      Claude / Codex / Antigravity / OpenCode(预留) 本地会话目录
-        │                                                     ChatGPT / Claude 网页与移动端扩展
-        │                                                                    │
-        │                                                                    │ POST /api/v1/agent/ingest
-        │                                                                    ▼
-        │                                                      xworkmate-bridge (8787)
-        │                                                      白名单无状态转发, 128 KiB 上限, 令牌置换
-        │                                                                    │ POST /api/v1/agent/ingest
-        │  本地采集与增量 Cursor                                               │ (带 QMD_INGEST_TOKEN)
-        ▼                                                                    ▼
+        │                ChatGPT / Claude 网页·移动端扩展  +  CLI / APP 扩展插件 (Claude Code · Codex · Antigravity · OpenCode)
+        │                                         ▲ │  双向：获取任务 / 列表 / 共享记忆  +  提交会话事实
+        │                                         │ │  GET catalog / threads / briefing / memory / sync   POST ingest
+        │                                         │ ▼
+        │                          xworkmate-bridge (8787)  无状态、白名单路由、128 KiB 上限、令牌置换
+        │                                         ▲ │
+        │  本地采集与增量 Cursor                     │ │ (带 QMD 服务凭据)
+        ▼                                         │ ▼
  T1 QMD Daemon (8181)  npx tsx src/cli/qmd.ts mcp --http
         ├─ 本地多会话直采：~/.claude, ~/.codex, ~/.gemini, opencode (预留)
         ├─ 纯函数确定性合并状态机 (Unicode NFKC + 规则，无 LLM 幻觉)
         ├─ PgContextStore：pg_advisory_xact_lock 保证同分支串行关联
-        ├─ MCP 服务端：task_resume / task_note / task_handoff / task_claim
-        └─ 单向 Ingest 接口：POST /api/v1/agent/ingest
+        ├─ MCP 服务端：task_resume / task_note / task_handoff / task_claim / task_catalog
+        ├─ 写入接口：POST /api/v1/agent/ingest
+        └─ 读取接口：GET /api/v1/agent/catalog / threads / briefing / memory / sync（所有客户端经 bridge 可访问）
         │
         ▼ 127.0.0.1:15432 (本地直连, QMD_PG_SSL=disable)
  T2 持久层  postgresql.svc.plus (容器化 PG 17)
@@ -137,7 +140,7 @@ SELECT pg_advisory_xact_lock(hashtext('thread:' || $scope || ':' || $head_branch
 - **GPT Codex CLI / Desktop** (`codex.ts`)：增量扫描 `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`；
 - **Google Antigravity** (`antigravity.ts`)：只读打开 `~/.gemini/antigravity/conversation_summaries.db`；
 - **OpenCode** (`opencode.ts`)：预留探针；
-- **安全脱敏** (`redact.ts`)：入库前正则抹除 GitHub Token、OpenAI/Anthropic Key 等敏感信息。
+- **安全脱敏** (`redact.ts`)：入库前按正则识别 GitHub Token、OpenAI/Anthropic Key 等凭据，命中的条目整条丢弃（不做部分脱敏）。
 
 ---
 
@@ -150,12 +153,46 @@ SELECT pg_advisory_xact_lock(hashtext('thread:' || $scope || ':' || $head_branch
   - `task_note(cwd, kind, note)`：轻量追加决策或踩坑；
   - `task_handoff(cwd, next_action)`：收工交接，释放主导权；
   - `task_claim / task_who / task_release / task_board / task_heartbeat`：继承既有文件独占协议。
-- **HTTP Ingest 端点**：
-  - `POST /api/v1/agent/ingest`：内部 Bearer 鉴权（`QMD_INGEST_TOKEN`），接受结构化条目提交。
+- **HTTP 端点**（只接受 bridge 的服务凭据，不直接面向终端客户端）：
+  - `POST /api/v1/agent/ingest`：结构化条目提交；非主导会话的 goal / next_action 一律存为 proposed。
+  - `GET /api/v1/agent/catalog`：置顶任务、共享工程、活跃 claim、近期线程（已实现）。
+  - `GET /api/v1/agent/threads`、`GET /api/v1/agent/threads/{id}/briefing`：线程列表与合并简报（待实现）。
+  - `GET /api/v1/agent/memory?query=`：共享记忆检索（线程内 decision / pitfall 条目 + `qmd_memory` 项目记忆）（待实现）。
+  - `GET /api/v1/agent/sync?cursor=`：自游标以来变化的线程 / 条目 / 置顶任务 / 工程，供插件增量拉取（待实现，需要全局单调游标，见 §7.3）。
 
-### 7.2 xworkmate-bridge（8787 端口）
+### 7.2 xworkmate-bridge（8787 端口）：所有客户端双向
 
-- **纯单向透传网关**：
-  - 仅暴露 `POST /api/v1/agent/ingest`，限制请求体 $\le$ 128 KiB；
-  - 校验客户端 `AI_WORKSPACE_AUTH_TOKEN`，向上游转发时置换为 `QMD_INGEST_TOKEN`；
-  - 严格禁止任何读接口，无状态、不存数据。
+| 客户端 | 获取（任务 / 列表 / 共享记忆） | 提交（会话事实） |
+|---|---|---|
+| ChatGPT / Claude 网页与手机端扩展 | ✅ `GET /api/v1/agent/catalog`、`/threads`、`/threads/{id}/briefing`、`/memory`、`/sync` | ✅ `POST /api/v1/agent/ingest` |
+| CLI / APP 扩展插件（Claude Code、Codex、Antigravity、OpenCode） | ✅ 同上 | ✅ 同上 |
+
+- **转发**：校验入站凭据后，向 QMD 转发时置换为 QMD 服务凭据；只转发上表白名单路由与方法，其余 `/api/v1/agent/*` 返回 404/405；请求体 $\le$ 128 KiB，响应有上限、`Cache-Control: no-store`、不跟随重定向。
+- **身份**：账户身份来自凭据（Accounts 内省或本地静态令牌），请求体里自报的身份不作数。
+- **写入语义不变**：经 ingest 提交的 goal / next_action 不持有主导租约，一律存为 proposed；累积字段正常合并。
+- **无状态**：不缓存、不存储、不合并。
+- **实现状态**（2026-09-17，分支 qmd `feat/agent-read-sync`、bridge `feat/agent-read-mcp-passthrough`、portal `fix/ai-workspace-catalog-auth`）：
+  1. ✅ QMD 读路由 catalog / threads / briefing / memory / sync 已实现，分页上限 200；bridge 按路由白名单转发查询参数，读响应上限 2 MiB，超限返回 502 而不是截断。
+  2. ✅ 全局变更游标：`qmd_ctx_thread` / `qmd_ctx_item` / `qmd_pinned_task` / `qmd_shared_project` 由触发器写入 `change_xid`(xid8) 与 `change_seq`，按 `pg_snapshot_xmin` 之下分页，慢事务不会被游标越过。
+  3. ✅ catalog 不再返回绝对路径（scope + 仓库相对路径 / 云端项目引用 / 目录名），取消置顶与移除的工程以 `removed_at` 墓碑同步。
+  4. ✅ 远程部署 MCP：bridge `POST|GET|DELETE /api/v1/agent/mcp` 透传到 QMD `/mcp`（`Mcp-Session-Id` 往返、SSE 流式、凭据置换为 `BRIDGE_QMD_MCP_TOKEN`）；QMD 设置 `QMD_MCP_TOKEN` 后 `/mcp`、`/query` 必须鉴权，非回环监听无令牌拒绝启动；工具在远程模式下需显式传 scope/branch。
+  5. ✅ bridge lint（gosimple S1017）已修复。
+  6. ⏳ 未完成：线上 QMD / PG 实例尚未部署；MCP 会话保存在单个 QMD 进程内，多实例需按 `Mcp-Session-Id` 粘性路由；memory 目前是词法检索（ILIKE），未接入向量检索。
+
+### 7.3 双向同步协议（网页 / 移动端扩展与 CLI / APP 插件共用）
+
+- **推送**：沿用 ingest，`clientRequestId` 保证重放幂等；冲突由 QMD 的合并规则与 fence 处理，bridge 不参与。
+- **拉取**：`GET /sync?cursor=<opaque>` 返回自游标以来的变更，并给出新游标。需要在 `qmd_ctx_event` 之外增加**全局单调序号**（现有 `seq` 只在线程内单调），置顶任务与共享工程的变更也要进入同一变更流。
+- **本地优先**：插件在本机可直接读 QMD（8181）时优先直连；跨机器或远程 QMD 时才走 bridge。
+- **回环防护**：插件从 sync 拉到的条目再推回时，`item_sources` 已记录来源，合并结果为 `touch`，不会产生回声写入。
+
+## 8. 各端侧边栏呈现：能力边界
+
+| 客户端 | 原生侧边栏可否由第三方写入 | 可行的呈现方式 |
+|---|---|---|
+| Claude Code Desktop | 否。只能管理 Claude 自己的会话（分组、置顶，ccd sidebar 接口） | 以共享工程为名建分组、把对应 Claude 会话归组 / 置顶；外部任务通过 MCP `task_catalog` / `task_resume` 在对话内呈现 |
+| Codex Desktop | 否，无插件侧边栏扩展点。侧边栏来自其私有 `state_5.sqlite` | 原生“导入外部 Agent 会话”（已把 13 个 Claude Code 会话导入 Codex 侧边栏）；其余经 MCP 呈现 |
+| Antigravity | 否。Electron 应用，未发现插件侧边栏扩展点 | MCP（`~/.gemini/antigravity/mcp/qmd` 已配置） |
+| portal `/ai-workspace` | 是（自有前端） | 左边栏置顶任务 / 共享工程 / 活跃会话分组，数据经 bridge 读路由 |
+
+结论：**原生侧边栏不能靠插件注入外部任务**；可行路径是 ① 各端原生的导入 / 分组能力，② MCP 工具或网页/手机端扩展经 bridge 读路由在对话或扩展面板内呈现，③ 自有 UI（portal）。直接写各应用私有数据库属于不受支持的做法，不采用。

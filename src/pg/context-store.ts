@@ -94,38 +94,131 @@ export interface Briefing {
   events: Array<{ seq: number; type: string; createdAt: string; payload: Record<string, unknown> }>;
 }
 
-export interface SharedProject {
-  id: string;
+/** Where a project or task lives, without machine-specific absolute paths. */
+export interface SharedLocationRef {
+  kind: "repo" | "chatgpt-project" | "directory";
+  /** Git scope (github.com/org/repo) for repositories, else null. */
+  scope: string | null;
+  /** Repo-relative subpath, cloud project ref, or dir:<name>. */
+  location: string;
+}
+
+export interface SharedProject extends SharedLocationRef {
+  /** Stable identity across agents and machines (scope, scope/subpath, or ref). */
+  key: string;
   name: string;
-  rootPath: string;
   sources: string[];
   updatedAt: string;
+  removedAt: string | null;
 }
 
 export interface PinnedTask {
   id: string;
   source: string;
   title: string;
-  cwd?: string;
+  scope: string | null;
+  location: string | null;
+  projectName?: string;
+  gitBranch?: string;
+  position: number;
+  updatedAt: string;
+  removedAt: string | null;
+}
+
+export interface SharedProjectInput extends SharedLocationRef {
+  key: string;
+  name: string;
+  source: string;
+}
+
+export interface PinnedTaskInput {
+  id: string;
+  source: string;
+  title: string;
+  scope: string | null;
+  location: string | null;
   projectName?: string;
   gitBranch?: string;
   position: number;
   updatedAt: string;
 }
 
+export interface ActiveClaim {
+  scope: string;
+  resource: string;
+  agentId: string;
+  agentKind: string;
+  intent: string;
+  expiresAt: string;
+  threadId?: string;
+}
+
+export interface Page {
+  limit: number;
+  offset: number;
+}
+
 export interface TaskCatalog {
   [key: string]: unknown;
   pinnedTasks: PinnedTask[];
   sharedProjects: SharedProject[];
-  activeClaims: Array<{
-    resource: string;
-    agentId: string;
-    agentKind: string;
-    intent: string;
-    expiresAt: string;
-    threadId?: string;
-  }>;
+  activeClaims: ActiveClaim[];
   recentThreads: ContextThread[];
+  page: { limit: number; offset: number; pinnedTotal: number; projectsTotal: number };
+}
+
+export interface MemoryHit {
+  type: "context_item" | "project_memory";
+  kind: string;
+  text: string;
+  detail: string | null;
+  status: string | null;
+  scope: string | null;
+  threadId: string | null;
+  headBranch: string | null;
+  prNumber: number | null;
+  sources: string[];
+  updatedAt: string;
+  key: string;
+}
+
+export type SyncChange =
+  | { type: "thread"; seq: string; thread: ContextThread }
+  | { type: "item"; seq: string; threadId: string; item: Omit<BriefingItem, "sources"> }
+  | { type: "pinned_task"; seq: string; pinnedTask: PinnedTask }
+  | { type: "shared_project"; seq: string; sharedProject: SharedProject };
+
+export interface SyncPage {
+  changes: SyncChange[];
+  nextCursor: string;
+  hasMore: boolean;
+}
+
+/** Default and maximum page sizes for read routes. */
+export const DEFAULT_PAGE_LIMIT = 50;
+export const MAX_PAGE_LIMIT = 200;
+
+export function clampPage(limit?: number, offset?: number): Page {
+  const l = Number.isFinite(limit) && (limit as number) > 0 ? Math.floor(limit as number) : DEFAULT_PAGE_LIMIT;
+  const o = Number.isFinite(offset) && (offset as number) > 0 ? Math.floor(offset as number) : 0;
+  return { limit: Math.min(l, MAX_PAGE_LIMIT), offset: o };
+}
+
+/** Sync cursor: "<xid8>:<seq>" base64url-encoded. "0:0" starts from the beginning. */
+export function encodeSyncCursor(xid: string, seq: string): string {
+  return Buffer.from(`${xid}:${seq}`, "utf8").toString("base64url");
+}
+
+export function decodeSyncCursor(cursor: string | undefined): { xid: string; seq: string } {
+  if (!cursor) return { xid: "0", seq: "0" };
+  const raw = Buffer.from(cursor, "base64url").toString("utf8");
+  const m = /^(\d{1,20}):(\d{1,20})$/.exec(raw);
+  if (!m) throw new Error("invalid sync cursor");
+  return { xid: m[1]!, seq: m[2]! };
+}
+
+function escapeLike(text: string): string {
+  return text.replace(/[\\%_]/g, (c) => `\\${c}`);
 }
 
 /** Branch names too broad to identify a piece of work on their own. */
@@ -155,6 +248,40 @@ function toThread(row: any): ContextThread {
     lastEventSeq: Number(row.last_event_seq),
     createdAt: new Date(row.created_at).toISOString(),
     updatedAt: new Date(row.updated_at).toISOString(),
+  };
+}
+
+function cmpBig(a: string, b: string): number {
+  const x = BigInt(a);
+  const y = BigInt(b);
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+
+function toSharedProject(r: any): SharedProject {
+  return {
+    key: r.project_key,
+    name: r.name,
+    kind: r.kind,
+    scope: r.scope ?? null,
+    location: r.location,
+    sources: r.sources ?? [],
+    updatedAt: new Date(r.updated_at).toISOString(),
+    removedAt: r.removed_at ? new Date(r.removed_at).toISOString() : null,
+  };
+}
+
+function toPinnedTask(r: any): PinnedTask {
+  return {
+    id: r.id,
+    source: r.source,
+    title: r.title,
+    scope: r.scope ?? null,
+    location: r.location ?? null,
+    ...(r.project_name ? { projectName: r.project_name } : {}),
+    ...(r.git_branch ? { gitBranch: r.git_branch } : {}),
+    position: Number(r.position),
+    updatedAt: new Date(r.updated_at).toISOString(),
+    removedAt: r.removed_at ? new Date(r.removed_at).toISOString() : null,
   };
 }
 
@@ -729,115 +856,287 @@ export class PgContextStore {
 
   // ── Pinned tasks & Shared projects catalog ─────────────────────────────
 
-  async upsertSharedProjects(
-    projects: Array<{ id: string; name: string; rootPath: string; source: string }>,
-  ): Promise<void> {
-    for (const p of projects) {
-      await this.client.exec(
-        `INSERT INTO qmd_shared_project (id, name, root_path, sources, updated_at)
-         VALUES ($1, $2, $3, ARRAY[$4]::text[], now())
-         ON CONFLICT (root_path) DO UPDATE
-           SET name = EXCLUDED.name,
-               sources = ARRAY(SELECT DISTINCT UNNEST(qmd_shared_project.sources || EXCLUDED.sources)),
-               updated_at = now()`,
-        [p.id, p.name, p.rootPath, p.source],
+  /**
+   * Upsert the projects a source currently knows, and retract that source from
+   * projects it no longer lists. A project no source lists any more is
+   * tombstoned (removed_at) rather than deleted, so sync consumers see it go.
+   */
+  async syncSharedProjects(source: string, projects: SharedProjectInput[]): Promise<void> {
+    await this.client.tx(async (tx) => {
+      for (const p of projects) {
+        await tx.exec(
+          `INSERT INTO qmd_shared_project (id, project_key, name, kind, scope, location, sources, updated_at, removed_at)
+           VALUES ($1, $1, $2, $3, $4, $5, ARRAY[$6]::text[], now(), NULL)
+           ON CONFLICT (project_key) DO UPDATE
+             SET name = EXCLUDED.name, kind = EXCLUDED.kind, scope = EXCLUDED.scope, location = EXCLUDED.location,
+                 sources = ARRAY(SELECT DISTINCT UNNEST(qmd_shared_project.sources || EXCLUDED.sources) ORDER BY 1),
+                 removed_at = NULL, updated_at = now()
+           WHERE qmd_shared_project.name IS DISTINCT FROM EXCLUDED.name
+              OR qmd_shared_project.removed_at IS NOT NULL
+              OR NOT ($6 = ANY(qmd_shared_project.sources))`,
+          [p.key, p.name, p.kind, p.scope, p.location, source],
+        );
+      }
+      const keep = projects.map((p) => p.key);
+      await tx.exec(
+        `UPDATE qmd_shared_project
+            SET sources = array_remove(sources, $1),
+                removed_at = CASE WHEN sources = ARRAY[$1]::text[] THEN now() ELSE removed_at END,
+                updated_at = now()
+          WHERE $1 = ANY(sources) AND NOT (project_key = ANY($2::text[]))`,
+        [source, keep],
       );
-    }
+    });
   }
 
-  async upsertPinnedTasks(tasks: PinnedTask[]): Promise<void> {
-    for (const t of tasks) {
-      await this.client.exec(
-        `INSERT INTO qmd_pinned_task (id, source, title, cwd, project_name, git_branch, position, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         ON CONFLICT (id) DO UPDATE
-           SET source = EXCLUDED.source,
-               title = EXCLUDED.title,
-               cwd = EXCLUDED.cwd,
-               project_name = EXCLUDED.project_name,
-               git_branch = EXCLUDED.git_branch,
-               position = EXCLUDED.position,
-               updated_at = EXCLUDED.updated_at`,
-        [
-          t.id,
-          t.source,
-          t.title,
-          t.cwd ?? null,
-          t.projectName ?? null,
-          t.gitBranch ?? null,
-          t.position ?? 0,
-          t.updatedAt ?? new Date().toISOString(),
-        ],
+  /** Replace a source's pinned tasks; unpinned ones are tombstoned. */
+  async syncPinnedTasks(source: string, tasks: PinnedTaskInput[]): Promise<void> {
+    await this.client.tx(async (tx) => {
+      for (const t of tasks) {
+        await tx.exec(
+          `INSERT INTO qmd_pinned_task
+             (id, source, title, cwd, scope, location, project_name, git_branch, position, updated_at, removed_at)
+           VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8, $9, NULL)
+           ON CONFLICT (id) DO UPDATE
+             SET source = EXCLUDED.source, title = EXCLUDED.title, scope = EXCLUDED.scope,
+                 location = EXCLUDED.location, project_name = EXCLUDED.project_name,
+                 git_branch = EXCLUDED.git_branch, position = EXCLUDED.position,
+                 updated_at = EXCLUDED.updated_at, removed_at = NULL
+           WHERE (qmd_pinned_task.title, qmd_pinned_task.scope, qmd_pinned_task.location,
+                  qmd_pinned_task.project_name, qmd_pinned_task.git_branch, qmd_pinned_task.position,
+                  qmd_pinned_task.updated_at)
+                 IS DISTINCT FROM
+                 (EXCLUDED.title, EXCLUDED.scope, EXCLUDED.location, EXCLUDED.project_name,
+                  EXCLUDED.git_branch, EXCLUDED.position, EXCLUDED.updated_at)
+              OR qmd_pinned_task.removed_at IS NOT NULL`,
+          [t.id, source, t.title, t.scope, t.location, t.projectName ?? null, t.gitBranch ?? null, t.position,
+            t.updatedAt],
+        );
+      }
+      await tx.exec(
+        `UPDATE qmd_pinned_task SET removed_at = now()
+          WHERE source = $1 AND removed_at IS NULL AND NOT (id = ANY($2::text[]))`,
+        [source, tasks.map((t) => t.id)],
       );
-    }
+    });
   }
 
-  async listSharedProjects(): Promise<SharedProject[]> {
+  async listSharedProjects(page: Page = clampPage()): Promise<{ rows: SharedProject[]; total: number }> {
     const rows = await this.client.query<any>(
-      `SELECT id, name, root_path, sources, updated_at FROM qmd_shared_project ORDER BY name ASC`,
+      `SELECT project_key, name, kind, scope, location, sources, updated_at, removed_at,
+              count(*) OVER () AS total
+         FROM qmd_shared_project WHERE removed_at IS NULL
+        ORDER BY name ASC LIMIT $1 OFFSET $2`,
+      [page.limit, page.offset],
     );
-    return rows.map((r) => ({
-      id: r.id,
-      name: r.name,
-      rootPath: r.root_path,
-      sources: r.sources ?? [],
-      updatedAt: new Date(r.updated_at).toISOString(),
-    }));
+    return { rows: rows.map(toSharedProject), total: rows.length ? Number(rows[0].total) : await this.countLive("qmd_shared_project") };
   }
 
-  async listPinnedTasks(source?: string): Promise<PinnedTask[]> {
-    const sql = source
-      ? `SELECT id, source, title, cwd, project_name, git_branch, position, updated_at
-         FROM qmd_pinned_task WHERE source = $1 ORDER BY position ASC, updated_at DESC`
-      : `SELECT id, source, title, cwd, project_name, git_branch, position, updated_at
-         FROM qmd_pinned_task ORDER BY position ASC, updated_at DESC`;
-    const rows = await this.client.query<any>(sql, source ? [source] : []);
-    return rows.map((r) => ({
-      id: r.id,
-      source: r.source,
-      title: r.title,
-      cwd: r.cwd ?? undefined,
-      projectName: r.project_name ?? undefined,
-      gitBranch: r.git_branch ?? undefined,
-      position: Number(r.position),
-      updatedAt: new Date(r.updated_at).toISOString(),
-    }));
+  async listPinnedTasks(page: Page = clampPage(), source?: string): Promise<{ rows: PinnedTask[]; total: number }> {
+    const rows = await this.client.query<any>(
+      `SELECT id, source, title, scope, location, project_name, git_branch, position, updated_at, removed_at,
+              count(*) OVER () AS total
+         FROM qmd_pinned_task
+        WHERE removed_at IS NULL AND ($1::text IS NULL OR source = $1)
+        ORDER BY position ASC, updated_at DESC LIMIT $2 OFFSET $3`,
+      [source ?? null, page.limit, page.offset],
+    );
+    return { rows: rows.map(toPinnedTask), total: rows.length ? Number(rows[0].total) : await this.countLive("qmd_pinned_task") };
   }
 
-  async getCatalog(_cwd?: string): Promise<TaskCatalog> {
-    const pinnedTasks = await this.listPinnedTasks();
-    const sharedProjects = await this.listSharedProjects();
+  private async countLive(table: "qmd_pinned_task" | "qmd_shared_project"): Promise<number> {
+    const row = await this.client.queryOne<{ n: string }>(`SELECT count(*) AS n FROM ${table} WHERE removed_at IS NULL`);
+    return Number(row?.n ?? 0);
+  }
 
-    const activeClaimsRaw = await this.client.query<any>(
-      `SELECT resource, agent_id, agent_kind, intent, thread_id,
+  async listActiveClaims(scope?: string): Promise<ActiveClaim[]> {
+    const rows = await this.client.query<any>(
+      `SELECT scope, resource, agent_id, agent_kind, intent, thread_id,
               (heartbeat_at + make_interval(secs => ttl_seconds)) AS expires_at
-       FROM qmd_task_claim
-       WHERE status = 'active' AND heartbeat_at > now() - make_interval(secs => ttl_seconds)
-       ORDER BY claimed_at DESC`,
+         FROM qmd_task_claim
+        WHERE status = 'active' AND heartbeat_at > now() - make_interval(secs => ttl_seconds)
+          AND ($1::text IS NULL OR scope = $1)
+        ORDER BY claimed_at DESC LIMIT ${MAX_PAGE_LIMIT}`,
+      [scope ?? null],
     );
-    const activeClaims = activeClaimsRaw.map((c) => ({
+    return rows.map((c) => ({
+      scope: c.scope,
       resource: c.resource,
       agentId: c.agent_id,
       agentKind: c.agent_kind,
       intent: c.intent,
       expiresAt: new Date(c.expires_at).toISOString(),
-      threadId: c.thread_id ?? undefined,
+      ...(c.thread_id ? { threadId: c.thread_id } : {}),
+    }));
+  }
+
+  /** Threads across all scopes (or one), newest first, paged. */
+  async listThreads(opts: { scope?: string; all?: boolean; page?: Page } = {}): Promise<
+    { rows: Array<ContextThread & { items: number; sessions: number }>; total: number }
+  > {
+    const page = opts.page ?? clampPage();
+    const rows = await this.client.query<any>(
+      `SELECT ${THREAD_COLUMNS.split(",").map((c) => `t.${c.trim()}`).join(", ")},
+              (SELECT count(*) FROM qmd_ctx_item i WHERE i.thread_id = t.id) AS items,
+              (SELECT count(*) FROM qmd_ctx_session s WHERE s.thread_id = t.id) AS sessions,
+              count(*) OVER () AS total
+         FROM qmd_ctx_thread t
+        WHERE t.merged_into IS NULL
+          AND ($1::text IS NULL OR t.scope = $1)
+          AND ($2::boolean OR t.state IN ${LIVE_STATES})
+        ORDER BY t.updated_at DESC
+        LIMIT $3 OFFSET $4`,
+      [opts.scope ?? null, !!opts.all, page.limit, page.offset],
+    );
+    return {
+      rows: rows.map((r) => ({ ...toThread(r), items: Number(r.items), sessions: Number(r.sessions) })),
+      total: rows.length ? Number(rows[0].total) : 0,
+    };
+  }
+
+  async getCatalog(opts: { scope?: string; page?: Page } = {}): Promise<TaskCatalog> {
+    const page = opts.page ?? clampPage();
+    const [pinned, projects, activeClaims, recent] = await Promise.all([
+      this.listPinnedTasks(page),
+      this.listSharedProjects(page),
+      this.listActiveClaims(opts.scope),
+      this.listThreads({ ...(opts.scope ? { scope: opts.scope } : {}), page: { limit: 20, offset: 0 } }),
+    ]);
+    return {
+      pinnedTasks: pinned.rows,
+      sharedProjects: projects.rows,
+      activeClaims,
+      recentThreads: recent.rows.map(({ items: _i, sessions: _s, ...t }) => t),
+      page: { limit: page.limit, offset: page.offset, pinnedTotal: pinned.total, projectsTotal: projects.total },
+    };
+  }
+
+  // ── Shared memory search ────────────────────────────────────────────────
+
+  /**
+   * Search shared memory: merged thread items (decisions, pitfalls,
+   * verification, questions, …) plus project memories in qmd_memory when that
+   * table exists. Lexical (ILIKE) so it needs no embedder on the read path.
+   */
+  async searchMemory(opts: { query?: string; scope?: string; kinds?: string[]; page?: Page }): Promise<{
+    hits: MemoryHit[];
+    hasMore: boolean;
+  }> {
+    const page = opts.page ?? clampPage();
+    const q = opts.query?.trim() ? `%${escapeLike(opts.query.trim())}%` : null;
+    const kinds = opts.kinds?.length ? opts.kinds : ["decision", "pitfall", "verification", "question", "blocker", "goal", "next_action", "plan_step"];
+    const fetch = page.limit + page.offset + 1;
+
+    const items = await this.client.query<any>(
+      `SELECT i.kind, i.item_key, i.status, i.body, i.updated_at, t.id AS thread_id, t.scope, t.head_branch, t.pr_number,
+              coalesce(array_agg(DISTINCT s.source) FILTER (WHERE s.source IS NOT NULL), '{}') AS sources
+         FROM qmd_ctx_item i
+         JOIN qmd_ctx_thread t ON t.id = i.thread_id AND t.merged_into IS NULL
+         LEFT JOIN qmd_ctx_item_source x ON x.item_id = i.id
+         LEFT JOIN qmd_ctx_session s ON s.id = x.session_id
+        WHERE i.kind = ANY($1::text[])
+          AND ($2::text IS NULL OR t.scope = $2)
+          AND ($3::text IS NULL OR i.body->>'text' ILIKE $3 OR i.body->>'detail' ILIKE $3)
+        GROUP BY i.id, t.id
+        ORDER BY i.updated_at DESC
+        LIMIT $4`,
+      [kinds, opts.scope ?? null, q, fetch],
+    );
+    const hits: MemoryHit[] = items.map((r) => ({
+      type: "context_item",
+      kind: r.kind,
+      key: r.item_key,
+      text: r.body.text,
+      detail: r.body.detail ?? null,
+      status: r.status,
+      scope: r.scope,
+      threadId: r.thread_id,
+      headBranch: r.head_branch ?? null,
+      prNumber: r.pr_number ?? null,
+      sources: r.sources ?? [],
+      updatedAt: new Date(r.updated_at).toISOString(),
     }));
 
-    const recentRows = await this.client.query<any>(
-      `SELECT ${THREAD_COLUMNS}
-       FROM qmd_ctx_thread
-       WHERE state IN ${LIVE_STATES}
-       ORDER BY updated_at DESC LIMIT 20`,
-    );
-    const recentThreads = recentRows.map(toThread);
-
+    const memoryTable = await this.client.queryOne<{ t: string | null }>(`SELECT to_regclass('qmd_memory')::text AS t`);
+    if (memoryTable?.t && (!opts.kinds?.length || opts.kinds.includes("project_memory"))) {
+      const mem = await this.client.query<any>(
+        `SELECT m.namespace, m.key, m.title, m.updated_at, left(c.body, 400) AS body
+           FROM qmd_memory m JOIN qmd_memory_content c ON c.namespace = m.namespace AND c.hash = m.hash
+          WHERE m.active AND ($1::text IS NULL OR m.title ILIKE $1 OR c.body ILIKE $1)
+          ORDER BY m.updated_at DESC LIMIT $2`,
+        [q, fetch],
+      );
+      for (const r of mem) {
+        hits.push({
+          type: "project_memory",
+          kind: "project_memory",
+          key: `${r.namespace}/${r.key}`,
+          text: r.title || r.key,
+          detail: r.body,
+          status: null,
+          scope: null,
+          threadId: null,
+          headBranch: null,
+          prNumber: null,
+          sources: [r.namespace],
+          updatedAt: new Date(r.updated_at).toISOString(),
+        });
+      }
+      hits.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    }
     return {
-      pinnedTasks,
-      sharedProjects,
-      activeClaims,
-      recentThreads,
+      hits: hits.slice(page.offset, page.offset + page.limit),
+      hasMore: hits.length > page.offset + page.limit,
     };
+  }
+
+  // ── Change feed (two-way sync) ──────────────────────────────────────────
+
+  /**
+   * Changes after `cursor`, ordered by (transaction id, sequence). Only rows
+   * written by transactions below pg_snapshot_xmin are returned: those
+   * transactions are finished, so nothing can later commit behind the cursor.
+   * A thread with mergedInto set means its items now live in that thread.
+   */
+  async changesSince(cursor: string | undefined, limit = DEFAULT_PAGE_LIMIT): Promise<SyncPage> {
+    const { xid, seq } = decodeSyncCursor(cursor);
+    const max = Math.min(Math.max(1, Math.floor(limit)), MAX_PAGE_LIMIT);
+    return this.client.tx(async (tx) => {
+      await tx.exec(`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY`);
+      const snap = await tx.queryOne<{ xmin: string }>(`SELECT pg_snapshot_xmin(pg_current_snapshot())::text AS xmin`);
+      const xmin = snap!.xmin;
+      const after = `(change_xid, change_seq) > ($1::xid8, $2::bigint) AND change_xid < $3::xid8`;
+      const params = [xid, seq, xmin, max + 1];
+      const [threads, items, pins, projects] = await Promise.all([
+        tx.query<any>(`SELECT ${THREAD_COLUMNS}, change_xid::text AS cx, change_seq FROM qmd_ctx_thread WHERE ${after} ORDER BY change_xid, change_seq LIMIT $4`, params),
+        tx.query<any>(`SELECT thread_id, kind, item_key, status, ord, body, git_head, change_xid::text AS cx, change_seq FROM qmd_ctx_item WHERE ${after} ORDER BY change_xid, change_seq LIMIT $4`, params),
+        tx.query<any>(`SELECT id, source, title, scope, location, project_name, git_branch, position, updated_at, removed_at, change_xid::text AS cx, change_seq FROM qmd_pinned_task WHERE ${after} ORDER BY change_xid, change_seq LIMIT $4`, params),
+        tx.query<any>(`SELECT project_key, name, kind, scope, location, sources, updated_at, removed_at, change_xid::text AS cx, change_seq FROM qmd_shared_project WHERE ${after} ORDER BY change_xid, change_seq LIMIT $4`, params),
+      ]);
+      type Row = { cx: string; seq: string; change: SyncChange };
+      const merged: Row[] = [
+        ...threads.map((r) => ({ cx: r.cx, seq: String(r.change_seq), change: { type: "thread" as const, seq: String(r.change_seq), thread: toThread(r) } })),
+        ...items.map((r) => ({
+          cx: r.cx, seq: String(r.change_seq),
+          change: {
+            type: "item" as const, seq: String(r.change_seq), threadId: r.thread_id,
+            item: { kind: r.kind, key: r.item_key, status: r.status, ord: r.ord ?? null, text: r.body.text,
+              detail: r.body.detail ?? null, at: r.body.at, gitHead: r.git_head ?? null },
+          },
+        })),
+        ...pins.map((r) => ({ cx: r.cx, seq: String(r.change_seq), change: { type: "pinned_task" as const, seq: String(r.change_seq), pinnedTask: toPinnedTask(r) } })),
+        ...projects.map((r) => ({ cx: r.cx, seq: String(r.change_seq), change: { type: "shared_project" as const, seq: String(r.change_seq), sharedProject: toSharedProject(r) } })),
+      ];
+      merged.sort((a, b) => cmpBig(a.cx, b.cx) || cmpBig(a.seq, b.seq));
+      const page = merged.slice(0, max);
+      const hasMore = merged.length > max;
+      const last = page[page.length - 1];
+      // Nothing new below xmin: jump the cursor to xmin so the next poll starts there.
+      const nextCursor = last
+        ? encodeSyncCursor(last.cx, last.seq)
+        : cmpBig(xmin, xid) > 0 ? encodeSyncCursor(xmin, "0") : encodeSyncCursor(xid, seq);
+      return { changes: page.map((r) => r.change), nextCursor, hasMore };
+    });
   }
 
   // ── Collector cursors ───────────────────────────────────────────────────

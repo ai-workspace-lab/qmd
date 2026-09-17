@@ -27,6 +27,13 @@ describe.skipIf(!PG_URL)("PgContextStore (integration)", () => {
   });
 
   afterAll(async () => {
+    const { PgClient } = await import("../src/pg/db-pg.js");
+    const admin = await PgClient.create(resolvePgConfig({ ...process.env, QMD_BACKEND: "pg" }));
+    try {
+      await admin.exec(`DELETE FROM qmd_ctx_thread WHERE scope = $1`, [SCOPE]);
+    } finally {
+      await admin.close();
+    }
     if (store) await store.close();
   });
 
