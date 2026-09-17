@@ -1,0 +1,195 @@
+/**
+ * mcp/context-tools.ts - MCP tools for shared task context
+ *
+ * task_resume / task_note / task_handoff let any MCP-capable client (Claude
+ * Code, Codex, Antigravity, OpenCode) pick up the PR/branch thread another
+ * client left, add to it, and hand it on. Like the task_* claim tools they take
+ * `cwd` explicitly: a shared HTTP daemon does not run in the caller's checkout.
+ */
+
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import {
+  ITEM_KINDS,
+  resolveBaseSha,
+  resolveBranch,
+  resolveScope,
+  type ContextBridge,
+  type ContextThread,
+  type IncomingItem,
+} from "../pg/index.js";
+import { renderBriefing } from "../pg/context-brief.js";
+
+const itemSchema = z.object({
+  kind: z.enum(ITEM_KINDS),
+  text: z.string().describe("Short text: the step, decision, pitfall, command, or repo-relative path"),
+  status: z
+    .string()
+    .optional()
+    .describe("plan_step: todo|doing|done|dropped · verification: pass|fail|not_run · question/blocker: open|resolved"),
+  key: z.string().optional().describe("Stable key: plan step key or decision memory key"),
+  detail: z.string().optional().describe("path: modified|claimed|reviewed · resolution text for question/blocker"),
+});
+
+type ItemArg = z.infer<typeof itemSchema>;
+
+export function registerContextTools(server: McpServer, ctx: ContextBridge, fallbackScope: string): void {
+  const store = ctx.store;
+
+  /** Client identity: explicit arg, else the MCP client's own name. */
+  const sourceOf = (client?: string): string => {
+    const name = client?.trim() || server.server.getClientVersion()?.name || "mcp";
+    return `mcp:${name.toLowerCase().replace(/[^a-z0-9._-]+/g, "-")}`;
+  };
+
+  const threadFor = async (
+    args: { thread_id?: string | undefined; cwd?: string | undefined; scope?: string | undefined; pr?: number | undefined },
+  ): Promise<{ thread: ContextThread; created: boolean } | { error: string }> => {
+    if (args.thread_id) {
+      const thread = await store.getThread(args.thread_id);
+      return thread ? { thread, created: false } : { error: `thread ${args.thread_id} not found` };
+    }
+    const cwd = args.cwd;
+    const scope = args.scope?.trim() || (cwd ? resolveScope(undefined, process.env, cwd) : fallbackScope);
+    const branch = cwd ? resolveBranch(cwd) : undefined;
+    const head = cwd ? resolveBaseSha(cwd) : undefined;
+    const resolved = await store.resolveThread({
+      scope,
+      ...(branch ? { headBranch: branch } : {}),
+      ...(args.pr ? { prNumber: args.pr } : {}),
+      ...(head ? { headSha: head } : {}),
+    });
+    if (!resolved.ok) {
+      return {
+        error:
+          `${branch ?? "this checkout"} is a default branch, so it does not identify a task. ` +
+          `Pass pr, or thread_id of an existing thread.`,
+      };
+    }
+    return { thread: resolved.thread, created: resolved.created };
+  };
+
+  const toItems = (items: ItemArg[] | undefined, cwd?: string): IncomingItem[] => {
+    const head = cwd ? resolveBaseSha(cwd) : undefined;
+    return (items ?? []).map((i) => ({
+      kind: i.kind,
+      text: i.text,
+      ...(i.status ? { status: i.status } : {}),
+      ...(i.key ? { key: i.key } : {}),
+      ...(i.detail ? { detail: i.detail } : {}),
+      ...(head ? { gitHead: head } : {}),
+    }));
+  };
+
+  server.registerTool(
+    "task_resume",
+    {
+      title: "Resume the shared task for this branch",
+      description:
+        "Call at the START of a session. Finds the task thread for the checkout's PR/branch — the one " +
+        "other clients (Claude Code, Codex, Antigravity, OpenCode, web) have been contributing to — attaches " +
+        "you to it and returns the merged briefing: goal, next action, plan, decisions, pitfalls, " +
+        "verification results, touched paths, and git drift against your checkout. Set lead=true when you " +
+        "intend to change direction (goal, next action, plan order); otherwise you contribute as a peer.",
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+      inputSchema: {
+        cwd: z.string().optional().describe("Absolute path of your checkout (strongly recommended)"),
+        thread_id: z.string().optional().describe("Resume a specific thread instead of resolving from cwd"),
+        pr: z.number().optional().describe("PR number, when known"),
+        scope: z.string().optional().describe("Project key; omit to derive from cwd"),
+        lead: z.boolean().optional().describe("Acquire the driver lease"),
+        takeover: z.boolean().optional().describe("With lead: take over a handed-off or paused thread"),
+        client: z.string().optional().describe("Your client name, e.g. claude-code, codex, antigravity"),
+        session_id: z.string().optional().describe("Your client's own session id, for stable attribution"),
+      },
+    },
+    async ({ cwd, thread_id, pr, scope, lead, takeover, client, session_id }, extra) => {
+      const found = await threadFor({ thread_id, cwd, scope, pr });
+      if ("error" in found) return { content: [{ type: "text", text: found.error }], isError: true };
+      const head = cwd ? resolveBaseSha(cwd) : undefined;
+      const sessionId = await store.attachSession(found.thread.id, {
+        source: sourceOf(client),
+        sourceSessionId: session_id || extra.sessionId || "stdio",
+        agentKind: client ?? "unknown",
+        ...(head ? { headSha: head } : {}),
+      });
+      let leadNote = "";
+      let fence: number | null = null;
+      if (lead) {
+        const res = await store.lead(found.thread.id, sessionId, { takeover: !!takeover });
+        if (res.ok) fence = res.fence;
+        else leadNote = `\nNot the driver: session ${res.holder} holds the lease until ${res.leaseExpiresAt}. ` +
+          `Contribute as a peer, wait, or retry with takeover=true once it is handed off.`;
+      }
+      const briefing = await store.briefing(found.thread.id);
+      const text = renderBriefing(briefing!, { ...(cwd ? { cwd } : {}), sessionId }) +
+        (found.created ? "\n(new thread created for this branch)" : "") + leadNote +
+        `\n\nsession_id for task_note/task_handoff: ${sessionId}${fence !== null ? ` · fence ${fence}` : ""}`;
+      return {
+        content: [{ type: "text", text }],
+        structuredContent: { threadId: found.thread.id, sessionId, fence, created: found.created, briefing },
+      };
+    },
+  );
+
+  server.registerTool(
+    "task_note",
+    {
+      title: "Add to the shared task context",
+      description:
+        "Record important session facts as you work so any client can continue: decisions (with why), " +
+        "pitfalls you hit, verification commands with pass/fail, plan progress, open questions, repo-relative " +
+        "paths. Never include file contents, diffs, logs, secrets or absolute paths — they are rejected. " +
+        "goal/next_action from a non-driver are stored as proposals.",
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+      inputSchema: {
+        session_id: z.string().describe("session_id returned by task_resume"),
+        thread_id: z.string().optional().describe("Thread from task_resume; omit to resolve from cwd"),
+        cwd: z.string().optional().describe("Absolute path of your checkout"),
+        fence: z.number().optional().describe("Fence from task_resume when you are the driver"),
+        items: z.array(itemSchema).min(1).max(50),
+      },
+    },
+    async ({ session_id, thread_id, cwd, fence, items }) => {
+      const found = await threadFor({ thread_id, cwd });
+      if ("error" in found) return { content: [{ type: "text", text: found.error }], isError: true };
+      const result = await store.mergeItems(found.thread.id, session_id, toItems(items, cwd), {
+        ...(fence !== undefined ? { fence } : {}),
+      });
+      const text =
+        `Merged into ${found.thread.prNumber ? `PR #${found.thread.prNumber}` : found.thread.headBranch ?? found.thread.id}: ` +
+        `+${result.inserted} new, ${result.updated} updated, ${result.touched} already known` +
+        (result.proposed ? `, ${result.proposed} stored as proposals (you are not the driver)` : "") +
+        (result.rejected.length ? `\nRejected: ${result.rejected.map((r) => `${r.kind}: ${r.reason}`).join("; ")}` : "");
+      return { content: [{ type: "text", text }], structuredContent: { result } };
+    },
+  );
+
+  server.registerTool(
+    "task_handoff",
+    {
+      title: "Hand the task off",
+      description:
+        "Call before you stop or switch clients while you are the driver. Records the next action (required) " +
+        "and any final items, releases the driver lease and marks the thread handed off so the next client's " +
+        "task_resume starts exactly where you left off.",
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+      inputSchema: {
+        thread_id: z.string(),
+        session_id: z.string(),
+        fence: z.number(),
+        next_action: z.string().describe("One concrete, executable next step"),
+        cwd: z.string().optional(),
+        items: z.array(itemSchema).max(50).optional(),
+      },
+    },
+    async ({ thread_id, session_id, fence, next_action, cwd, items }) => {
+      const res = await store.handoff(thread_id, session_id, fence, next_action, toItems(items, cwd));
+      if (!res.ok) return { content: [{ type: "text", text: `Handoff refused: ${res.reason}` }], isError: true };
+      return {
+        content: [{ type: "text", text: `Handed off. Next: ${next_action}` }],
+        structuredContent: { result: res.merge },
+      };
+    },
+  );
+}

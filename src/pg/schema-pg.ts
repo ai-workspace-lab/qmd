@@ -228,3 +228,144 @@ export async function bootstrapTaskSchema(client: PgClient): Promise<void> {
        ON qmd_task_claim (agent_id, status)`,
   );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared task context (threads keyed by PR / branch, mergeable items)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Create the shared-context tables. Like the claim table this needs neither
+ * pgvector nor pg_jieba: it stores structured session facts (goal, plan, next
+ * action, decisions, pitfalls, verification, repo-relative paths), never
+ * artifacts. Idempotent. See docs/plan/multi-agent-shared-context.md.
+ */
+export async function bootstrapContextSchema(client: PgClient): Promise<void> {
+  await bootstrapTaskSchema(client);
+
+  await client.exec(`
+    CREATE TABLE IF NOT EXISTS qmd_ctx_thread (
+      id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      scope              text NOT NULL,
+      head_branch        text,
+      pr_number          integer,
+      pr_state           text,
+      title              text NOT NULL DEFAULT '',
+      state              text NOT NULL DEFAULT 'open',
+      merged_into        uuid REFERENCES qmd_ctx_thread(id),
+      head_sha           text,
+      driver_session_id  uuid,
+      lease_expires_at   timestamptz,
+      fence              bigint NOT NULL DEFAULT 0,
+      last_event_seq     bigint NOT NULL DEFAULT 0,
+      created_at         timestamptz NOT NULL DEFAULT now(),
+      updated_at         timestamptz NOT NULL DEFAULT now(),
+      CHECK (state IN ('open', 'paused', 'handed_off', 'done', 'abandoned')),
+      CHECK (pr_state IS NULL OR pr_state IN ('open', 'merged', 'closed')),
+      CHECK (merged_into IS NULL OR merged_into <> id)
+    )
+  `);
+  // One live thread per PR and per branch. A merged-away thread no longer
+  // counts; a finished branch thread frees its name for the next piece of work.
+  await client.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS qmd_ctx_thread_pr_uniq
+       ON qmd_ctx_thread (scope, pr_number)
+       WHERE pr_number IS NOT NULL AND merged_into IS NULL`,
+  );
+  await client.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS qmd_ctx_thread_branch_uniq
+       ON qmd_ctx_thread (scope, head_branch)
+       WHERE head_branch IS NOT NULL AND merged_into IS NULL
+         AND state IN ('open', 'paused', 'handed_off')`,
+  );
+  await tryExec(
+    client,
+    `CREATE INDEX IF NOT EXISTS qmd_ctx_thread_scope_idx
+       ON qmd_ctx_thread (scope, state, updated_at DESC)`,
+  );
+
+  // One row per (source session, thread): a transcript that switched branches
+  // contributes to more than one thread.
+  await client.exec(`
+    CREATE TABLE IF NOT EXISTS qmd_ctx_session (
+      id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      thread_id          uuid NOT NULL REFERENCES qmd_ctx_thread(id) ON DELETE CASCADE,
+      source             text NOT NULL,
+      source_session_id  text NOT NULL,
+      agent_kind         text NOT NULL DEFAULT 'unknown',
+      title              text NOT NULL DEFAULT '',
+      head_sha           text,
+      first_seen_at      timestamptz NOT NULL DEFAULT now(),
+      last_seen_at       timestamptz NOT NULL DEFAULT now(),
+      UNIQUE (source, source_session_id, thread_id)
+    )
+  `);
+
+  await client.exec(`
+    CREATE TABLE IF NOT EXISTS qmd_ctx_item (
+      id                  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+      thread_id           uuid NOT NULL REFERENCES qmd_ctx_thread(id) ON DELETE CASCADE,
+      kind                text NOT NULL,
+      item_key            text NOT NULL,
+      status              text NOT NULL,
+      ord                 integer,
+      body                jsonb NOT NULL,
+      git_head            text,
+      created_session_id  uuid REFERENCES qmd_ctx_session(id) ON DELETE SET NULL,
+      updated_session_id  uuid REFERENCES qmd_ctx_session(id) ON DELETE SET NULL,
+      created_at          timestamptz NOT NULL DEFAULT now(),
+      updated_at          timestamptz NOT NULL DEFAULT now(),
+      UNIQUE (thread_id, kind, item_key),
+      CHECK (kind IN ('goal', 'next_action', 'plan_step', 'decision', 'pitfall',
+                      'verification', 'path', 'question', 'blocker')),
+      CHECK (jsonb_typeof(body) = 'object'),
+      CHECK (octet_length(body::text) <= 4096)
+    )
+  `);
+
+  await client.exec(`
+    CREATE TABLE IF NOT EXISTS qmd_ctx_item_source (
+      item_id        bigint NOT NULL REFERENCES qmd_ctx_item(id) ON DELETE CASCADE,
+      session_id     uuid NOT NULL REFERENCES qmd_ctx_session(id) ON DELETE CASCADE,
+      first_seen_at  timestamptz NOT NULL DEFAULT now(),
+      last_seen_at   timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (item_id, session_id)
+    )
+  `);
+
+  await client.exec(`
+    CREATE TABLE IF NOT EXISTS qmd_ctx_event (
+      thread_id          uuid NOT NULL REFERENCES qmd_ctx_thread(id) ON DELETE CASCADE,
+      seq                bigint NOT NULL,
+      event_type         text NOT NULL,
+      session_id         uuid,
+      payload            jsonb NOT NULL DEFAULT '{}'::jsonb,
+      client_request_id  text NOT NULL DEFAULT '',
+      created_at         timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (thread_id, seq),
+      CHECK (jsonb_typeof(payload) = 'object'),
+      CHECK (octet_length(payload::text) <= 16384)
+    )
+  `);
+  await client.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS qmd_ctx_event_request_uniq
+       ON qmd_ctx_event (client_request_id) WHERE client_request_id <> ''`,
+  );
+
+  // Incremental collection state for local session directories. `meta` carries
+  // what a later chunk of the same file still needs (session id, cwd, branch,
+  // pending tool calls) without re-reading from byte 0.
+  await client.exec(`
+    CREATE TABLE IF NOT EXISTS qmd_ctx_ingest_cursor (
+      source       text NOT NULL,
+      path         text NOT NULL,
+      size         bigint NOT NULL DEFAULT 0,
+      mtime_ms     bigint NOT NULL DEFAULT 0,
+      byte_offset  bigint NOT NULL DEFAULT 0,
+      meta         jsonb NOT NULL DEFAULT '{}'::jsonb,
+      updated_at   timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (source, path)
+    )
+  `);
+
+  await client.exec(`ALTER TABLE qmd_task_claim ADD COLUMN IF NOT EXISTS thread_id uuid`);
+}

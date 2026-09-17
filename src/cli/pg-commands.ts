@@ -15,6 +15,10 @@ import {
   describeDrift,
 } from "../pg/index.js";
 import type { TaskClaim } from "../pg/index.js";
+import { openContextBridge, resolveScope, resolveAgentId, resolveAgentKind, ITEM_KINDS } from "../pg/index.js";
+import type { IncomingItem, ItemKind } from "../pg/index.js";
+import { renderBriefing } from "../pg/context-brief.js";
+import { SOURCES, runCollect } from "../collect/index.js";
 
 // Minimal ANSI helpers (kept local to avoid coupling to the formatter).
 const C = {
@@ -552,5 +556,242 @@ export async function runTaskCommand(args: string[], values: Values): Promise<nu
     return 1;
   } finally {
     await bridge.dispose();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// qmd ctx — shared task context
+// ─────────────────────────────────────────────────────────────────────────────
+
+function ctxHelp(): void {
+  console.error(`Usage: qmd ctx <sources|collect|threads|brief|note|lead|handoff> [options]
+
+Commands:
+  qmd ctx sources                      Local session directories this machine has
+  qmd ctx collect [--since 7d] [--source claude-code,codex] [--dry-run]
+                                       Extract important session facts into PR/branch threads
+  qmd ctx threads [--all]              Threads in this scope
+  qmd ctx brief [--thread id]          Merged handoff briefing (default: current branch)
+  qmd ctx note <kind> <text>           Add an item: ${ITEM_KINDS.join(" | ")}
+  qmd ctx lead                         Become the thread driver (needs a stable $QMD_AGENT_ID)
+  qmd ctx handoff --next "<action>"    Hand the thread off with the next action
+
+Options:
+  --cwd <dir>        Checkout to resolve scope/branch from (default: current directory)
+  --scope <key>      Project key (default: derived from git remote)
+  --pr <number>      Associate with a PR
+  --status <s>       Item status (plan: todo|doing|done|dropped, verification: pass|fail, ...)
+  --key <k>          Item key (plan step key / decision memory key)
+  --detail <text>    Path action or question resolution
+  --json             JSON output
+
+Only important session facts are stored — never file contents, diffs, logs or attachments.
+Requires: QMD_BACKEND=pg and QMD_PG_URL (collect --dry-run and sources work without).`);
+}
+
+function parseSince(raw: string | undefined): number {
+  if (!raw) return Date.now() - 7 * 86_400_000;
+  const m = /^(\d+)([mhd])$/.exec(raw.trim());
+  if (m) {
+    const n = Number.parseInt(m[1]!, 10);
+    const unit = m[2] === "m" ? 60_000 : m[2] === "h" ? 3_600_000 : 86_400_000;
+    return Date.now() - n * unit;
+  }
+  const t = Date.parse(raw);
+  if (Number.isNaN(t)) throw new Error(`invalid --since '${raw}' (use 30m, 12h, 7d or an ISO date)`);
+  return t;
+}
+
+/** Handle `qmd ctx ...`. Returns a process exit code. */
+export async function runCtxCommand(args: string[], values: Values): Promise<number> {
+  const sub = args[0];
+  if (!sub || sub === "help") {
+    ctxHelp();
+    return sub ? 0 : 1;
+  }
+  const json = !!values.json;
+  const cwd = str(values.cwd) ?? process.cwd();
+
+  if (sub === "sources") {
+    const rows = SOURCES.map((s) => ({ id: s.id, label: s.label, detected: s.detect(), implemented: s.implemented }));
+    if (json) console.log(JSON.stringify(rows, null, 2));
+    else
+      for (const r of rows) {
+        const mark = !r.implemented ? `${C.dim}○ reserved${C.reset}` : r.detected ? `${C.green}● ready${C.reset}` : `${C.dim}○ not found${C.reset}`;
+        console.log(`${mark}  ${C.bold}${r.id}${C.reset}  ${C.dim}${r.label}${C.reset}${!r.implemented && r.detected ? " (detected, not parsed yet)" : ""}`);
+      }
+    return 0;
+  }
+
+  const dryRun = !!values["dry-run"];
+  let bridge: Awaited<ReturnType<typeof openContextBridge>> | undefined;
+  if (!(sub === "collect" && dryRun)) {
+    try {
+      bridge = await openContextBridge();
+    } catch (err) {
+      console.error(`${C.red}✗${C.reset} ${(err as Error).message}`);
+      return 1;
+    }
+  }
+
+  const scope = resolveScope(str(values.scope), process.env, cwd);
+  const branch = resolveBranch(cwd);
+  const prRaw = Number.parseInt(String(values.pr ?? ""), 10);
+  const pr = Number.isInteger(prRaw) && prRaw > 0 ? prRaw : undefined;
+  const agentId = resolveAgentId(str(values.agent));
+  const agentKind = resolveAgentKind();
+
+  /** Resolve (creating if needed) the thread for this checkout and attach this CLI session. */
+  const attach = async () => {
+    const store = bridge!.store;
+    const threadId = str(values.thread);
+    let thread = threadId ? await store.getThread(threadId) : null;
+    if (!thread) {
+      const resolved = await store.resolveThread({
+        scope,
+        ...(branch ? { headBranch: branch } : {}),
+        ...(pr ? { prNumber: pr } : {}),
+        ...(resolveBaseSha(cwd) ? { headSha: resolveBaseSha(cwd)! } : {}),
+      });
+      if (!resolved.ok) {
+        throw new Error(`${branch ?? "this checkout"} is a default branch: pass --thread <id> or --pr <number>`);
+      }
+      thread = resolved.thread;
+    }
+    const sessionId = await store.attachSession(thread.id, {
+      source: "qmd-cli",
+      sourceSessionId: agentId,
+      agentKind,
+      ...(resolveBaseSha(cwd) ? { headSha: resolveBaseSha(cwd)! } : {}),
+    });
+    return { thread, sessionId };
+  };
+
+  try {
+    switch (sub) {
+      case "collect": {
+        const sources = str(values.source)?.split(",").map((x) => x.trim()).filter(Boolean);
+        const report = await runCollect({
+          ...(bridge ? { store: bridge.store } : {}),
+          ...(sources?.length ? { sources } : {}),
+          sinceMs: parseSince(str(values.since)),
+          dryRun,
+        });
+        const threads = [...report.threads.entries()].map(([label, t]) => ({
+          label,
+          scope: t.scope,
+          headBranch: t.headBranch,
+          prNumber: t.prNumber,
+          sources: [...t.sources],
+          sessions: t.sessions.size,
+          items: t.items,
+          ...(dryRun ? {} : { merged: t.merged }),
+        }));
+        const payload = {
+          dryRun,
+          files: report.files,
+          filesUnchanged: report.filesSkippedUnchanged,
+          sessions: report.sessions,
+          skipped: report.skipped,
+          secretsDropped: report.secretsDropped,
+          errors: report.errors,
+          threads,
+        };
+        if (json) {
+          console.log(JSON.stringify(payload, null, 2));
+        } else {
+          console.log(`${dryRun ? `${C.cyan}dry-run${C.reset} ` : ""}files ${report.files} (unchanged ${report.filesSkippedUnchanged}) · sessions ${report.sessions} · secrets dropped ${report.secretsDropped}`);
+          if (Object.keys(report.skipped).length) console.log(`${C.dim}skipped: ${JSON.stringify(report.skipped)}${C.reset}`);
+          for (const t of threads) {
+            const items = Object.entries(t.items).map(([k, n]) => `${k}:${n}`).join(" ");
+            const merged = "merged" in t && t.merged ? ` ${C.dim}→ +${t.merged.inserted} ~${t.merged.updated} =${t.merged.touched} ✗${t.merged.rejected}${C.reset}` : "";
+            console.log(`${C.green}●${C.reset} ${C.bold}${t.label}${C.reset} ${C.dim}[${t.sources.join(",")}] ×${t.sessions}${C.reset} ${items}${merged}`);
+          }
+          for (const e of report.errors.slice(0, 5)) console.error(`${C.red}✗${C.reset} ${e.path}: ${e.message}`);
+        }
+        return report.errors.length ? 2 : 0;
+      }
+
+      case "threads": {
+        const rows = await bridge!.store.threads(scope, { all: !!values.all });
+        if (json) console.log(JSON.stringify(rows, null, 2));
+        else if (!rows.length) console.log(`No threads in ${scope}.`);
+        else
+          for (const t of rows) {
+            const label = t.prNumber ? `#${t.prNumber} ${t.headBranch ?? ""}` : t.headBranch ?? t.title;
+            console.log(`${C.cyan}●${C.reset} ${C.bold}${label}${C.reset} ${C.dim}${t.state} · ${t.sessions} sessions · ${t.items} items · ${age(t.updatedAt)} · ${t.id}${C.reset}`);
+          }
+        return 0;
+      }
+
+      case "brief": {
+        const store = bridge!.store;
+        const threadId = str(values.thread);
+        const thread = threadId ? await store.getThread(threadId) : await store.findThread(scope, branch, pr);
+        if (!thread) {
+          console.error(`No thread for ${scope}${branch ? ` @ ${branch}` : ""}. Run 'qmd ctx collect' or 'qmd ctx note'.`);
+          return 1;
+        }
+        const briefing = await store.briefing(thread.id);
+        if (json) console.log(JSON.stringify(briefing, null, 2));
+        else console.log(renderBriefing(briefing!, { cwd }));
+        return 0;
+      }
+
+      case "note": {
+        const kind = args[1] as ItemKind | undefined;
+        const text = args.slice(2).join(" ") || (await readStdin());
+        if (!kind || !(ITEM_KINDS as readonly string[]).includes(kind) || !text) {
+          ctxHelp();
+          return 1;
+        }
+        const { thread, sessionId } = await attach();
+        const item: IncomingItem = {
+          kind,
+          text,
+          ...(str(values.status) ? { status: str(values.status)! } : {}),
+          ...(str(values.key) ? { key: str(values.key)! } : {}),
+          ...(str(values.detail) ? { detail: str(values.detail)! } : {}),
+          ...(resolveBaseSha(cwd) ? { gitHead: resolveBaseSha(cwd)! } : {}),
+        };
+        const result = await bridge!.store.mergeItems(thread.id, sessionId, [item]);
+        if (json) console.log(JSON.stringify(result, null, 2));
+        else if (result.rejected.length) console.error(`${C.red}✗${C.reset} rejected: ${result.rejected[0]!.reason}`);
+        else console.log(`${C.green}✓${C.reset} ${kind} merged into ${thread.headBranch ?? thread.id} (+${result.inserted} ~${result.updated} =${result.touched}${result.proposed ? `, ${result.proposed} proposed` : ""})`);
+        return result.rejected.length ? 1 : 0;
+      }
+
+      case "lead": {
+        const { thread, sessionId } = await attach();
+        const res = await bridge!.store.lead(thread.id, sessionId, { takeover: !!values.force });
+        if (json) console.log(JSON.stringify(res, null, 2));
+        else if (res.ok) console.log(`${C.green}✓${C.reset} driving ${thread.headBranch ?? thread.id} (fence ${res.fence})`);
+        else console.error(`${C.red}✗${C.reset} held by session ${res.holder} until ${res.leaseExpiresAt}`);
+        return res.ok ? 0 : 1;
+      }
+
+      case "handoff": {
+        const next = str(values.next);
+        if (!next) {
+          console.error(`${C.red}✗${C.reset} --next "<action>" is required`);
+          return 1;
+        }
+        const { thread, sessionId } = await attach();
+        const res = await bridge!.store.handoff(thread.id, sessionId, thread.fence, next);
+        if (json) console.log(JSON.stringify(res, null, 2));
+        else if (res.ok) console.log(`${C.green}✓${C.reset} handed off ${thread.headBranch ?? thread.id}`);
+        else console.error(`${C.red}✗${C.reset} ${res.reason}`);
+        return res.ok ? 0 : 1;
+      }
+
+      default:
+        ctxHelp();
+        return 1;
+    }
+  } catch (err) {
+    console.error(`${C.red}✗${C.reset} ${(err as Error).message}`);
+    return 1;
+  } finally {
+    await bridge?.dispose();
   }
 }

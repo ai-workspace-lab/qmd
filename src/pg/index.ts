@@ -10,10 +10,15 @@ import { LlamaCpp } from "../llm.js";
 import { resolvePgConfig, isPgBackend, type PgConnectionConfig } from "./config.js";
 import { PgMemoryStore } from "./memory-store.js";
 import { PgTaskStore } from "./task-store.js";
+import { PgContextStore } from "./context-store.js";
 import { resolveScope, resolveAgentId, resolveAgentKind } from "./task-scope.js";
 
 export { PgMemoryStore } from "./memory-store.js";
 export { PgTaskStore } from "./task-store.js";
+export { PgContextStore } from "./context-store.js";
+export type { ContextThread, Briefing, BriefingItem, MergeResult, ResolveInput } from "./context-store.js";
+export type { IncomingItem, ItemKind } from "./context-merge.js";
+export { ITEM_KINDS } from "./context-merge.js";
 export type { TaskClaim, ClaimInput, ClaimResult, ClaimStatus } from "./task-store.js";
 export {
   resolveScope,
@@ -124,4 +129,25 @@ export async function openTaskBridge(
     agentKind,
     dispose: () => store.close(),
   };
+}
+
+export interface ContextBridge {
+  store: PgContextStore;
+  config: PgConnectionConfig;
+  dispose(): Promise<void>;
+}
+
+/**
+ * Open the shared task context layer. Like the task bridge it needs no
+ * embedder: context items are structured facts, not semantic documents.
+ */
+export async function openContextBridge(env: NodeJS.ProcessEnv = process.env): Promise<ContextBridge> {
+  if (!isPgBackend(env)) {
+    throw new Error(
+      "PostgreSQL backend is not selected. Set QMD_BACKEND=pg and QMD_PG_URL to use shared task context.",
+    );
+  }
+  const config = resolvePgConfig(env);
+  const store = await PgContextStore.open(config);
+  return { store, config, dispose: () => store.close() };
 }
