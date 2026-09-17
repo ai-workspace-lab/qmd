@@ -7,6 +7,7 @@
  * `cwd` explicitly: a shared HTTP daemon does not run in the caller's checkout.
  */
 
+import { existsSync } from "node:fs";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import {
@@ -42,17 +43,45 @@ export function registerContextTools(server: McpServer, ctx: ContextBridge, fall
     return `mcp:${name.toLowerCase().replace(/[^a-z0-9._-]+/g, "-")}`;
   };
 
+  /**
+   * Where the caller's checkout is. Locally the daemon can inspect `cwd` with
+   * git. In remote mode (QMD behind xworkmate-bridge) the caller's directory
+   * does not exist on this host, so the client must send scope/branch/head_sha
+   * itself — silently deriving a scope from a missing path would file the work
+   * under the wrong project.
+   */
+  const checkoutOf = (
+    args: { cwd?: string | undefined; scope?: string | undefined; branch?: string | undefined; head_sha?: string | undefined },
+  ): { scope?: string; branch?: string; head?: string } | { error: string } => {
+    const local = args.cwd && existsSync(args.cwd) ? args.cwd : undefined;
+    if (args.cwd && !local && !args.scope?.trim()) {
+      return {
+        error:
+          `cwd ${args.cwd} does not exist on the QMD host (remote mode). ` +
+          `Pass scope (e.g. github.com/org/repo) and branch, and head_sha when known.`,
+      };
+    }
+    const scope = args.scope?.trim() || (local ? resolveScope(undefined, process.env, local) : undefined);
+    const branch = args.branch?.trim() || (local ? resolveBranch(local) : undefined);
+    const head = args.head_sha?.trim() || (local ? resolveBaseSha(local) : undefined);
+    return { ...(scope ? { scope } : {}), ...(branch ? { branch } : {}), ...(head ? { head } : {}) };
+  };
+
   const threadFor = async (
-    args: { thread_id?: string | undefined; cwd?: string | undefined; scope?: string | undefined; pr?: number | undefined },
+    args: {
+      thread_id?: string | undefined; cwd?: string | undefined; scope?: string | undefined;
+      pr?: number | undefined; branch?: string | undefined; head_sha?: string | undefined;
+    },
   ): Promise<{ thread: ContextThread; created: boolean } | { error: string }> => {
     if (args.thread_id) {
       const thread = await store.getThread(args.thread_id);
       return thread ? { thread, created: false } : { error: `thread ${args.thread_id} not found` };
     }
-    const cwd = args.cwd;
-    const scope = args.scope?.trim() || (cwd ? resolveScope(undefined, process.env, cwd) : fallbackScope);
-    const branch = cwd ? resolveBranch(cwd) : undefined;
-    const head = cwd ? resolveBaseSha(cwd) : undefined;
+    const checkout = checkoutOf(args);
+    if ("error" in checkout) return checkout;
+    const scope = checkout.scope ?? fallbackScope;
+    const branch = checkout.branch;
+    const head = checkout.head;
     const resolved = await store.resolveThread({
       scope,
       ...(branch ? { headBranch: branch } : {}),
@@ -69,8 +98,8 @@ export function registerContextTools(server: McpServer, ctx: ContextBridge, fall
     return { thread: resolved.thread, created: resolved.created };
   };
 
-  const toItems = (items: ItemArg[] | undefined, cwd?: string): IncomingItem[] => {
-    const head = cwd ? resolveBaseSha(cwd) : undefined;
+  const toItems = (items: ItemArg[] | undefined, cwd?: string, headSha?: string): IncomingItem[] => {
+    const head = headSha?.trim() || (cwd && existsSync(cwd) ? resolveBaseSha(cwd) : undefined);
     return (items ?? []).map((i) => ({
       kind: i.kind,
       text: i.text,
@@ -97,16 +126,18 @@ export function registerContextTools(server: McpServer, ctx: ContextBridge, fall
         thread_id: z.string().optional().describe("Resume a specific thread instead of resolving from cwd"),
         pr: z.number().optional().describe("PR number, when known"),
         scope: z.string().optional().describe("Project key; omit to derive from cwd"),
+        branch: z.string().optional().describe("Git branch; required with scope in remote mode"),
+        head_sha: z.string().optional().describe("Current HEAD sha; recommended in remote mode"),
         lead: z.boolean().optional().describe("Acquire the driver lease"),
         takeover: z.boolean().optional().describe("With lead: take over a handed-off or paused thread"),
         client: z.string().optional().describe("Your client name, e.g. claude-code, codex, antigravity"),
         session_id: z.string().optional().describe("Your client's own session id, for stable attribution"),
       },
     },
-    async ({ cwd, thread_id, pr, scope, lead, takeover, client, session_id }, extra) => {
-      const found = await threadFor({ thread_id, cwd, scope, pr });
+    async ({ cwd, thread_id, pr, scope, branch, head_sha, lead, takeover, client, session_id }, extra) => {
+      const found = await threadFor({ thread_id, cwd, scope, pr, branch, head_sha });
       if ("error" in found) return { content: [{ type: "text", text: found.error }], isError: true };
-      const head = cwd ? resolveBaseSha(cwd) : undefined;
+      const head = head_sha?.trim() || (cwd && existsSync(cwd) ? resolveBaseSha(cwd) : undefined);
       const sessionId = await store.attachSession(found.thread.id, {
         source: sourceOf(client),
         sourceSessionId: session_id || extra.sessionId || "stdio",
@@ -122,7 +153,7 @@ export function registerContextTools(server: McpServer, ctx: ContextBridge, fall
           `Contribute as a peer, wait, or retry with takeover=true once it is handed off.`;
       }
       const briefing = await store.briefing(found.thread.id);
-      const text = renderBriefing(briefing!, { ...(cwd ? { cwd } : {}), sessionId }) +
+      const text = renderBriefing(briefing!, { ...(cwd && existsSync(cwd) ? { cwd } : {}), sessionId }) +
         (found.created ? "\n(new thread created for this branch)" : "") + leadNote +
         `\n\nsession_id for task_note/task_handoff: ${sessionId}${fence !== null ? ` · fence ${fence}` : ""}`;
       return {
@@ -146,14 +177,17 @@ export function registerContextTools(server: McpServer, ctx: ContextBridge, fall
         session_id: z.string().describe("session_id returned by task_resume"),
         thread_id: z.string().optional().describe("Thread from task_resume; omit to resolve from cwd"),
         cwd: z.string().optional().describe("Absolute path of your checkout"),
+        scope: z.string().optional().describe("Project key; required with branch in remote mode when thread_id is omitted"),
+        branch: z.string().optional().describe("Git branch (remote mode)"),
+        head_sha: z.string().optional().describe("Current HEAD sha (remote mode)"),
         fence: z.number().optional().describe("Fence from task_resume when you are the driver"),
         items: z.array(itemSchema).min(1).max(50),
       },
     },
-    async ({ session_id, thread_id, cwd, fence, items }) => {
-      const found = await threadFor({ thread_id, cwd });
+    async ({ session_id, thread_id, cwd, scope, branch, head_sha, fence, items }) => {
+      const found = await threadFor({ thread_id, cwd, scope, branch, head_sha });
       if ("error" in found) return { content: [{ type: "text", text: found.error }], isError: true };
-      const result = await store.mergeItems(found.thread.id, session_id, toItems(items, cwd), {
+      const result = await store.mergeItems(found.thread.id, session_id, toItems(items, cwd, head_sha), {
         ...(fence !== undefined ? { fence } : {}),
       });
       const text =
@@ -180,11 +214,12 @@ export function registerContextTools(server: McpServer, ctx: ContextBridge, fall
         fence: z.number(),
         next_action: z.string().describe("One concrete, executable next step"),
         cwd: z.string().optional(),
+        head_sha: z.string().optional().describe("Current HEAD sha (remote mode)"),
         items: z.array(itemSchema).max(50).optional(),
       },
     },
-    async ({ thread_id, session_id, fence, next_action, cwd, items }) => {
-      const res = await store.handoff(thread_id, session_id, fence, next_action, toItems(items, cwd));
+    async ({ thread_id, session_id, fence, next_action, cwd, head_sha, items }) => {
+      const res = await store.handoff(thread_id, session_id, fence, next_action, toItems(items, cwd, head_sha));
       if (!res.ok) return { content: [{ type: "text", text: `Handoff refused: ${res.reason}` }], isError: true };
       return {
         content: [{ type: "text", text: `Handed off. Next: ${next_action}` }],
@@ -210,29 +245,29 @@ export function registerContextTools(server: McpServer, ctx: ContextBridge, fall
       },
     },
     async ({ cwd }) => {
-      const catalog = await store.getCatalog(cwd);
+      const catalog = await store.getCatalog(cwd ? { scope: resolveScope(undefined, process.env, cwd) } : {});
 
       let text = `# Shared Task & Project Catalog\n\n`;
 
-      text += `## 📌 Pinned Tasks (置顶任务 - ${catalog.pinnedTasks.length})\n`;
+      text += `## 📌 Pinned Tasks (置顶任务 - ${catalog.page.pinnedTotal})\n`;
       if (catalog.pinnedTasks.length === 0) {
         text += `*(No pinned tasks)*\n\n`;
       } else {
         for (const [idx, t] of catalog.pinnedTasks.entries()) {
           const proj = t.projectName ? ` [${t.projectName}]` : "";
           const branch = t.gitBranch ? ` (${t.gitBranch})` : "";
-          const dir = t.cwd ? ` \`${t.cwd}\`` : "";
-          text += `${idx + 1}. **${t.title}**${proj}${branch}\n   Source: \`${t.source}\` | Path: ${dir || "n/a"}\n`;
+          const where = t.scope ? `${t.scope}${t.location && t.location !== "." ? `/${t.location}` : ""}` : t.location ?? "n/a";
+          text += `${idx + 1}. **${t.title}**${proj}${branch}\n   Source: \`${t.source}\` | Location: \`${where}\`\n`;
         }
         text += "\n";
       }
 
-      text += `## 📁 Shared Projects (共享项目 - ${catalog.sharedProjects.length})\n`;
+      text += `## 📁 Shared Projects (共享项目 - ${catalog.page.projectsTotal})\n`;
       if (catalog.sharedProjects.length === 0) {
         text += `*(No shared projects)*\n\n`;
       } else {
         for (const p of catalog.sharedProjects) {
-          text += `- **${p.name}**: \`${p.rootPath}\` (sources: ${p.sources.join(", ")})\n`;
+          text += `- **${p.name}**: \`${p.key}\` (${p.kind}; sources: ${p.sources.join(", ")})\n`;
         }
         text += "\n";
       }

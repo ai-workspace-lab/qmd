@@ -46,7 +46,7 @@ import {
 } from "../pg/index.js";
 import { registerContextTools } from "./context-tools.js";
 import { handleAgentIngest, INGEST_PATH } from "./agent-ingest.js";
-import { handleAgentCatalog, CATALOG_PATH } from "./agent-catalog.js";
+import { handleAgentRead, isAgentReadPath, bearerMatches } from "./agent-read.js";
 
 enableProductionMode();
 
@@ -700,8 +700,17 @@ function registerMemoryTools(server: McpServer, memory: MemoryBridge): void {
  * server and caller do share a directory.
  */
 function registerTaskTools(server: McpServer, task: TaskBridge): void {
-  const scopeOf = (scope?: string, cwd?: string): string =>
-    scope?.trim() || (cwd ? resolveScope(undefined, process.env, cwd) : task.scope);
+  // In remote mode the caller's cwd does not exist on this host; refuse to guess
+  // a scope from a missing path (it would silently file claims under a basename).
+  const scopeOf = (scope?: string, cwd?: string): string => {
+    if (scope?.trim()) return scope.trim();
+    if (!cwd) return task.scope;
+    if (!existsSync(cwd)) {
+      throw new Error(`cwd ${cwd} does not exist on the QMD host (remote mode): pass scope explicitly`);
+    }
+    return resolveScope(undefined, process.env, cwd);
+  };
+  const localCwd = (cwd?: string): string | undefined => (cwd && existsSync(cwd) ? cwd : undefined);
 
   server.registerTool(
     "task_claim",
@@ -733,8 +742,8 @@ function registerTaskTools(server: McpServer, task: TaskBridge): void {
         agentId: task.agentId,
         agentKind: task.agentKind,
         intent: intent ?? "",
-        ...(resolveBranch(cwd) ? { branch: resolveBranch(cwd)! } : {}),
-        ...(resolveBaseSha(cwd) ? { baseSha: resolveBaseSha(cwd)! } : {}),
+        ...(localCwd(cwd) && resolveBranch(cwd) ? { branch: resolveBranch(cwd)! } : {}),
+        ...(localCwd(cwd) && resolveBaseSha(cwd) ? { baseSha: resolveBaseSha(cwd)! } : {}),
         ...(ttl_seconds ? { ttlSeconds: ttl_seconds } : {}),
         force: !!force,
       });
@@ -812,7 +821,7 @@ function registerTaskTools(server: McpServer, task: TaskBridge): void {
           structuredContent: { released: null },
         };
       }
-      const drift = describeDrift(released.baseSha ?? undefined, resource, cwd);
+      const drift = localCwd(cwd) ? describeDrift(released.baseSha ?? undefined, resource, cwd) : undefined;
       const text =
         `Released ${resource} (${released.status}).` +
         (drift
@@ -955,6 +964,18 @@ export type HttpServerHandle = {
  * Binds to localhost only. Returns a handle for shutdown and port discovery.
  */
 export async function startMcpHttpServer(port: number, options?: { quiet?: boolean }): Promise<HttpServerHandle> {
+  // MCP and search over HTTP. When QMD sits behind xworkmate-bridge (remote
+  // mode) these must be authenticated: the bridge forwards with QMD_MCP_TOKEN.
+  // A daemon bound beyond loopback refuses to start without it.
+  const mcpToken = process.env.QMD_MCP_TOKEN?.trim() || undefined;
+  const listenHost = process.env.QMD_MCP_HOST || "127.0.0.1";
+  const loopback = listenHost === "127.0.0.1" || listenHost === "::1" || listenHost === "localhost";
+  if (!loopback && !mcpToken) {
+    throw new Error(`QMD_MCP_HOST=${listenHost} is not loopback: set QMD_MCP_TOKEN to protect /mcp and /query`);
+  }
+  const mcpAuthorized = (req: IncomingMessage): boolean =>
+    !mcpToken || bearerMatches(req.headers.authorization, mcpToken);
+
   const configPath = getConfigPath();
   const store = await createStore({
     dbPath: getDefaultDbPath(),
@@ -1059,14 +1080,21 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         return;
       }
 
-      if (pathname === CATALOG_PATH || pathname.startsWith(`${CATALOG_PATH}?`)) {
-        await handleAgentCatalog(nodeReq, nodeRes, context, ingestToken);
-        log(`${ts()} ${nodeReq.method} ${CATALOG_PATH} ${nodeRes.statusCode} (${Date.now() - reqStart}ms)`);
+      const routePath = pathname.split("?")[0]!;
+      if (isAgentReadPath(routePath)) {
+        await handleAgentRead(nodeReq, nodeRes, context, ingestToken);
+        log(`${ts()} ${nodeReq.method} ${routePath} ${nodeRes.statusCode} (${Date.now() - reqStart}ms)`);
         return;
       }
 
       // REST endpoint: POST /search — structured search without MCP protocol
       // REST endpoint: POST /query (alias: /search) — structured search without MCP protocol
+      if ((pathname === "/mcp" || pathname === "/query" || pathname === "/search") && !mcpAuthorized(nodeReq)) {
+        nodeRes.writeHead(401, { "Content-Type": "application/json", "WWW-Authenticate": "Bearer" });
+        nodeRes.end(JSON.stringify({ error: { code: "unauthorized", message: "missing or invalid bearer token" } }));
+        return;
+      }
+
       if ((pathname === "/query" || pathname === "/search") && nodeReq.method === "POST") {
         const rawBody = await collectBody(nodeReq);
         const params = JSON.parse(rawBody);
@@ -1213,8 +1241,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
   await new Promise<void>((resolve, reject) => {
     httpServer.on("error", reject);
-    const host = process.env.QMD_MCP_HOST || "127.0.0.1";
-    httpServer.listen(port, host, () => resolve());
+    httpServer.listen(port, listenHost, () => resolve());
   });
 
   const actualPort = (httpServer.address() as import("net").AddressInfo).port;

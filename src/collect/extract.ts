@@ -50,11 +50,45 @@ export function scrubCommand(command: string, repoRoot: string, home = homedir()
   return normalizeText(text);
 }
 
+/**
+ * Strip heredoc bodies (`cat > file <<'EOF' ... EOF`) before segmenting a
+ * command. A heredoc's payload is file content being written, not something
+ * the shell executes — without this, a fixture or script that happens to
+ * mention "go test" inside the heredoc body gets misread as a real test run.
+ */
+function stripHeredocs(command: string): string {
+  const re = /<<[-~]?\s*(['"]?)(\w+)\1[^\n]*\n([\s\S]*?)(?:\n\2\b|$)/g;
+  return command.replace(re, "");
+}
+
+/**
+ * A segment runs a check only when the check is its command word — optionally
+ * behind env assignments, `env [-u VAR]`, `time` or `sudo`. Text that merely
+ * mentions a check (a markdown bullet inside a multi-line commit message, a JSON
+ * fixture line) does not count.
+ */
+const CHECK_COMMANDS =
+  "go (?:test|vet)|vitest|bun test|(?:npm|pnpm|yarn)(?: run)? test|npx vitest|pytest|make (?:test|check|lint)|cargo (?:test|clippy)|tsc --noEmit|golangci-lint|terraform validate|helm lint";
+const CHECK_AT_START = new RegExp(
+  "^(?:[A-Za-z_][A-Za-z0-9_]*=\\S*\\s+)*" + // VAR=value prefixes
+    "(?:env(?:\\s+-u\\s+\\S+|\\s+[A-Za-z_][A-Za-z0-9_]*=\\S*)*\\s+)?" + // env [-u VAR] [VAR=value]
+    "(?:time\\s+|sudo\\s+)?" +
+    `(?:${CHECK_COMMANDS})(?![\\w-])`,
+);
+const NOT_A_COMMAND = /[`{}]|"(?:cmd|result|exitCode)"|exitCode/;
+
+function runsCheck(segment: string): boolean {
+  const text = segment.trim();
+  return CHECK_AT_START.test(text) && !NOT_A_COMMAND.test(text);
+}
+
 /** Pick the segment of a compound shell command that actually ran the check. */
 export function verificationSegment(command: string): string | undefined {
-  if (!VERIFY_COMMAND.test(command)) return undefined;
-  const segments = command.split(/\s*(?:&&|\|\||;|\n)\s*/);
-  const hit = segments.find((s) => VERIFY_COMMAND.test(s)) ?? command;
+  const withoutHeredocs = stripHeredocs(command);
+  if (!VERIFY_COMMAND.test(withoutHeredocs)) return undefined;
+  const segments = withoutHeredocs.split(/\s*(?:&&|\|\||;|\n)\s*/);
+  const hit = segments.find(runsCheck);
+  if (!hit) return undefined;
   const text = normalizeText(hit.replace(/\s*\|.*$/, "").replace(/\s*2>&1.*$/, ""));
   return text.length > MAX_COMMAND_CHARS ? text.slice(0, MAX_COMMAND_CHARS) : text;
 }

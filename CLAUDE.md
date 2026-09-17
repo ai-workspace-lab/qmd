@@ -183,7 +183,10 @@ qmd ctx note pitfall "…" | lead | handoff --next "…"
 ```
 
 MCP: `task_resume`, `task_note`, `task_handoff` (pass `cwd`). HTTP daemon also
-serves write-only `POST /api/v1/agent/ingest` when `QMD_INGEST_TOKEN` is set.
+serves `POST /api/v1/agent/ingest` and `GET /api/v1/agent/catalog` when
+`QMD_INGEST_TOKEN` is set. Through xworkmate-bridge, every client (web/mobile
+extensions and CLI/APP plugins) can both read tasks, lists and shared memory and
+submit session facts (docs/plan/multi-agent-shared-context.md §7).
 Code: `src/pg/context-*.ts`, `src/collect/`, `src/mcp/context-tools.ts`,
 `src/mcp/agent-ingest.ts`. Collectors only ever read client session
 directories; never modify them.
