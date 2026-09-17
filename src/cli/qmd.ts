@@ -100,7 +100,7 @@ import {
   loadConfig,
 } from "../collections.js";
 import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
-import { runMemoryCommand, runPgCommand, runTaskCommand } from "./pg-commands.js";
+import { runMemoryCommand, runPgCommand, runTaskCommand, runCtxCommand } from "./pg-commands.js";
 
 // Enable production mode - allows using default database path
 // Tests must set INDEX_PATH or use createStore() with explicit path
@@ -2545,6 +2545,14 @@ function parseCLI() {
       pr: { type: "string" },         // associated PR number
       status: { type: "string" },     // done | abandoned (release)
       stale: { type: "boolean" },     // include TTL-lapsed claims in ls
+      // Shared task context options
+      since: { type: "string" },      // collect window: 7d, 12h, 30m or an ISO date
+      source: { type: "string" },     // comma-separated collector ids
+      thread: { type: "string" },     // thread id
+      cwd: { type: "string" },        // checkout directory (default: current)
+      next: { type: "string" },       // next action for a handoff
+      key: { type: "string" },        // item key (plan stepKey / decision memoryKey)
+      detail: { type: "string" },     // path action or question resolution
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -2738,6 +2746,7 @@ function showHelp(): void {
   console.log("  qmd memory add/search/get/rm  - Shared PG memory bridge (needs QMD_BACKEND=pg)");
   console.log("  qmd pg status                 - Show PostgreSQL memory backend health");
   console.log("  qmd task claim/who/release    - Multi-agent coordination (needs QMD_BACKEND=pg)");
+  console.log("  qmd ctx collect/threads/brief - Shared task context across agent clients (needs QMD_BACKEND=pg)");
   console.log("  qmd sync [--dry-run]          - Secure two-way sync with a remote QMD host");
   console.log("  qmd bench <fixture.json>      - Run search quality benchmarks against a fixture file");
   console.log("");
@@ -3459,6 +3468,11 @@ if (isMain) {
 
     case "task": {
       const code = await runTaskCommand(cli.args, cli.values);
+      process.exit(code);
+    }
+
+    case "ctx": {
+      const code = await runCtxCommand(cli.args, cli.values);
       process.exit(code);
     }
 

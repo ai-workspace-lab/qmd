@@ -35,13 +35,17 @@ import {
   isPgBackend,
   openMemoryBridge,
   openTaskBridge,
+  openContextBridge,
   resolveScope,
   resolveBranch,
   resolveBaseSha,
   describeDrift,
   type MemoryBridge,
   type TaskBridge,
+  type ContextBridge,
 } from "../pg/index.js";
+import { registerContextTools } from "./context-tools.js";
+import { handleAgentIngest, INGEST_PATH } from "./agent-ingest.js";
 
 enableProductionMode();
 
@@ -187,6 +191,7 @@ async function createMcpServer(
   store: QMDStore,
   memory?: MemoryBridge,
   task?: TaskBridge,
+  context?: ContextBridge,
 ): Promise<McpServer> {
   const server = new McpServer(
     { name: "qmd", version: getPackageVersion() },
@@ -559,6 +564,9 @@ Intent-aware lex (C++ performance, not sports):
   if (task) {
     registerTaskTools(server, task);
   }
+  if (context) {
+    registerContextTools(server, context, task?.scope ?? resolveScope());
+  }
 
   return server;
 }
@@ -887,7 +895,8 @@ export async function startMcpServer(): Promise<void> {
   });
   const memory = await maybeOpenMemoryBridge();
   const task = await maybeOpenTaskBridge();
-  const server = await createMcpServer(store, memory, task);
+  const context = await maybeOpenContextBridge();
+  const server = await createMcpServer(store, memory, task, context);
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
@@ -905,6 +914,17 @@ async function maybeOpenTaskBridge(): Promise<TaskBridge | undefined> {
     // Fail open. Coordination is advisory: an unreachable PG must degrade to
     // "no coordination", never to "no agent".
     console.error(`[qmd:mcp] task coordination disabled: ${(err as Error).message}`);
+    return undefined;
+  }
+}
+
+async function maybeOpenContextBridge(): Promise<ContextBridge | undefined> {
+  if (!isPgBackend()) return undefined;
+  try {
+    return await openContextBridge();
+  } catch (err) {
+    // Same fail-open stance as coordination: no shared context, still an agent.
+    console.error(`[qmd:mcp] shared task context disabled: ${(err as Error).message}`);
     return undefined;
   }
 }
@@ -952,6 +972,11 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
   // Antigravity. See docs/plan/agent-task-coordination.md §8.1.
   const task = await maybeOpenTaskBridge();
 
+  // Shared task context: MCP task_resume/task_note/task_handoff plus the one-way
+  // ingest endpoint that xworkmate-bridge forwards web/mobile contributions to.
+  const context = await maybeOpenContextBridge();
+  const ingestToken = process.env.QMD_INGEST_TOKEN?.trim() || undefined;
+
   // Session map: each client gets its own McpServer + Transport pair (MCP spec requirement).
   // The store is shared — it's stateless SQLite, safe for concurrent access.
   const sessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
@@ -965,7 +990,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         log(`${ts()} New session ${sessionId} (${sessions.size} active)`);
       },
     });
-    const server = await createMcpServer(store, memory, task);
+    const server = await createMcpServer(store, memory, task, context);
     await server.connect(transport);
 
     transport.onclose = () => {
@@ -1024,6 +1049,12 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
         nodeRes.end(body);
         log(`${ts()} GET /health (${Date.now() - reqStart}ms)`);
+        return;
+      }
+
+      if (pathname === INGEST_PATH || pathname.startsWith(`${INGEST_PATH}?`)) {
+        await handleAgentIngest(nodeReq, nodeRes, context, ingestToken);
+        log(`${ts()} ${nodeReq.method} ${INGEST_PATH} ${nodeRes.statusCode} (${Date.now() - reqStart}ms)`);
         return;
       }
 
@@ -1175,7 +1206,8 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
   await new Promise<void>((resolve, reject) => {
     httpServer.on("error", reject);
-    httpServer.listen(port, "localhost", () => resolve());
+    const host = process.env.QMD_MCP_HOST || "127.0.0.1";
+    httpServer.listen(port, host, () => resolve());
   });
 
   const actualPort = (httpServer.address() as import("net").AddressInfo).port;
@@ -1191,6 +1223,8 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
     httpServer.close();
     await store.close();
     if (memory) await memory.dispose();
+    if (task) await task.dispose();
+    if (context) await context.dispose();
   };
 
   process.on("SIGTERM", async () => {
