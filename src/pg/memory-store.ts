@@ -13,7 +13,13 @@
 
 import { PgClient, toVectorLiteral } from "./db-pg.js";
 import type { PgConnectionConfig } from "./config.js";
-import { bootstrapSchema, ensureVectorIndex, type FtsCapabilities } from "./schema-pg.js";
+import {
+  bootstrapSchema,
+  embeddingColumnType,
+  ensureVectorIndex,
+  type FtsCapabilities,
+  type VectorColumnType,
+} from "./schema-pg.js";
 import { hashContent, chunkDocument, getDocid } from "../store.js";
 import {
   DEFAULT_EMBED_MODEL_URI,
@@ -153,6 +159,14 @@ export class PgMemoryStore {
     return this.fts;
   }
 
+  /** Cached SQL type of the embedding column ("vector" or "halfvec"). */
+  private vecType?: VectorColumnType;
+
+  private async vectorCast(): Promise<VectorColumnType> {
+    if (!this.vecType) this.vecType = await embeddingColumnType(this.client);
+    return this.vecType;
+  }
+
   private ns(override?: string): string {
     return (override ?? "").trim() || this.defaultNamespace;
   }
@@ -172,6 +186,7 @@ export class PgMemoryStore {
     const texts = chunks.map((c) => formatDocForEmbedding(c.text, title, model));
     const embeddings = await this.embedder.embedBatch(texts, { isQuery: false, model });
 
+    const vecCast = await this.vectorCast();
     await this.client.tx(async (tx) => {
       await tx.exec(
         `INSERT INTO qmd_memory_content (namespace, hash, body)
@@ -201,7 +216,7 @@ export class PgMemoryStore {
         if (!emb || !chunk) continue;
         await tx.exec(
           `INSERT INTO qmd_memory_vectors (namespace, hash, seq, pos, embedding, model)
-           VALUES ($1, $2, $3, $4, $5::vector, $6)`,
+           VALUES ($1, $2, $3, $4, $5::${vecCast}, $6)`,
           [namespace, hash, i, chunk.pos, toVectorLiteral(emb.embedding), emb.model ?? model],
         );
       }
@@ -232,6 +247,7 @@ export class PgMemoryStore {
     );
     if (existing?.value === String(dim)) return;
     await ensureVectorIndex(this.client, dim);
+    this.vecType = undefined; // column may have been re-typed (vector -> halfvec)
     await this.client.exec(
       `INSERT INTO qmd_memory_config (namespace, key, value)
        VALUES ($1, 'vector_dim', $2)
@@ -270,12 +286,13 @@ export class PgMemoryStore {
       model,
     }))[0];
     if (qEmb) {
+      const vecCast = await this.vectorCast();
       const vecRows = await this.client.query<{ key: string }>(
         `SELECT m.key AS key
          FROM qmd_memory_vectors v
          JOIN qmd_memory m ON m.namespace = v.namespace AND m.hash = v.hash AND m.active
          WHERE v.namespace = $1
-         ORDER BY v.embedding <=> $2::vector
+         ORDER BY v.embedding <=> $2::${vecCast}
          LIMIT $3`,
         [namespace, toVectorLiteral(qEmb.embedding), candidateLimit],
       );

@@ -153,22 +153,65 @@ export async function bootstrapSchema(client: PgClient): Promise<FtsCapabilities
 }
 
 /**
+ * pgvector's HNSW index supports at most 2000 dimensions for `vector`; above
+ * that the column must be `halfvec` (16-bit floats, up to 4000 dims for HNSW).
+ * The default embedder (nvidia/nemotron-3-embed-1b) is fixed at 2048 dims.
+ */
+export const HNSW_VECTOR_MAX_DIMS = 2000;
+
+export type VectorColumnType = "vector" | "halfvec";
+
+/** Column / cast type to use for embeddings of `dimensions` length. */
+export function vectorTypeForDims(dimensions: number): VectorColumnType {
+  return dimensions > HNSW_VECTOR_MAX_DIMS ? "halfvec" : "vector";
+}
+
+/**
+ * Current SQL type of `qmd_memory_vectors.embedding` — `"halfvec"` once
+ * ensureVectorIndex() promoted it for >2000-dim embeddings, else `"vector"`.
+ * Callers use it to cast literals so inserts and `<=>` match the column.
+ */
+export async function embeddingColumnType(client: PgClient): Promise<VectorColumnType> {
+  const row = await client.queryOne<{ t: string }>(
+    `SELECT format_type(a.atttypid, a.atttypmod) AS t
+       FROM pg_attribute a
+      WHERE a.attrelid = 'qmd_memory_vectors'::regclass
+        AND a.attname = 'embedding' AND NOT a.attisdropped`,
+  );
+  return row?.t?.startsWith("halfvec") ? "halfvec" : "vector";
+}
+
+/**
  * Promote the embedding column to a fixed dimension and build an HNSW cosine
- * index. Best-effort: if dimensions are mixed or the operation fails, exact
- * search still works without the index.
+ * index. Dimensions above HNSW_VECTOR_MAX_DIMS use `halfvec(N)` with
+ * `halfvec_cosine_ops`; otherwise `vector(N)` with `vector_cosine_ops`.
+ * Best-effort: if dimensions are mixed or the operation fails, exact search
+ * still works without the index.
  */
 export async function ensureVectorIndex(client: PgClient, dimensions: number): Promise<boolean> {
   if (!Number.isInteger(dimensions) || dimensions <= 0) return false;
-  // Fix the column dimension (no-op if already that dimension).
-  const typed = await tryExec(
-    client,
-    `ALTER TABLE qmd_memory_vectors ALTER COLUMN embedding TYPE vector(${dimensions})`,
+  const type = vectorTypeForDims(dimensions);
+  const target = `${type}(${dimensions})`;
+  const current = await client.queryOne<{ t: string }>(
+    `SELECT format_type(a.atttypid, a.atttypmod) AS t
+       FROM pg_attribute a
+      WHERE a.attrelid = 'qmd_memory_vectors'::regclass
+        AND a.attname = 'embedding' AND NOT a.attisdropped`,
   );
-  if (!typed) return false;
+  if (current?.t !== target) {
+    // The old index (if any) carries the old operator class; drop it so the
+    // type change cannot fail on an incompatible opclass, then re-type.
+    await tryExec(client, "DROP INDEX IF EXISTS qmd_memory_vectors_hnsw_idx");
+    const typed = await tryExec(
+      client,
+      `ALTER TABLE qmd_memory_vectors ALTER COLUMN embedding TYPE ${target} USING embedding::${target}`,
+    );
+    if (!typed) return false;
+  }
   return tryExec(
     client,
     "CREATE INDEX IF NOT EXISTS qmd_memory_vectors_hnsw_idx " +
-      "ON qmd_memory_vectors USING hnsw (embedding vector_cosine_ops)",
+      `ON qmd_memory_vectors USING hnsw (embedding ${type}_cosine_ops)`,
   );
 }
 

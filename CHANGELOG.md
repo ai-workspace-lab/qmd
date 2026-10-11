@@ -90,6 +90,12 @@
 
 ### Fixes (ai-workspace-lab fork)
 
+- Embedding: switch the default model to `nvidia/nemotron-3-embed-1b`
+  (fixed 2048 dims). `nvidia/llama-nemotron-embed-1b-v2` was retired by NVIDIA
+  on 2026-08-25 and now answers HTTP 410.
+- PG memory bridge: `ensureVectorIndex()` uses `halfvec(N)` +
+  `halfvec_cosine_ops` when N > 2000 (pgvector's HNSW limit for `vector`);
+  inserts and `<=>` queries cast to the column's current type.
 - Embedding: default to an external OpenAI-compatible embeddings API
   (`nvidia/llama-nemotron-embed-1b-v2`) and require
   `QMD_ENABLE_LOCAL_MODELS=1` for local node-llama-cpp embedding, reranking,

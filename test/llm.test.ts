@@ -623,7 +623,7 @@ describe("LlamaCpp expand context size config", () => {
 });
 
 describe("LlamaCpp model resolution (config > env > default)", () => {
-  const HARDCODED_EMBED = "nvidia/llama-nemotron-embed-1b-v2";
+  const HARDCODED_EMBED = "nvidia/nemotron-3-embed-1b";
   const HARDCODED_RERANK = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
   const HARDCODED_GENERATE = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 
@@ -677,7 +677,7 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue({
       ok: true,
       json: async () => ({
-        model: "nvidia/llama-nemotron-embed-1b-v2",
+        model: "nvidia/nemotron-3-embed-1b",
         data: [{ index: 0, embedding: [0.1, 0.2, 0.3] }],
       }),
     } as Response);
@@ -690,13 +690,13 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
       }));
       const [, init] = fetchMock.mock.calls[0]!;
       expect(JSON.parse((init as RequestInit).body as string)).toEqual({
-        model: "nvidia/llama-nemotron-embed-1b-v2",
+        model: "nvidia/nemotron-3-embed-1b",
         input: ["hello"],
         input_type: "passage",
       });
       expect(result).toEqual({
         embedding: [0.1, 0.2, 0.3],
-        model: "nvidia/llama-nemotron-embed-1b-v2",
+        model: "nvidia/nemotron-3-embed-1b",
       });
     } finally {
       fetchMock.mockRestore();
@@ -721,17 +721,17 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue({
       ok: true,
       json: async () => ({
-        model: "nvidia/llama-nemotron-embed-1b-v2",
+        model: "nvidia/nemotron-3-embed-1b",
         data: [{ index: 0, embedding: [0.1, 0.2, 0.3] }],
       }),
     } as Response);
 
     try {
-      const llm = new LlamaCpp({ embedModel: "nvidia/llama-nemotron-embed-1b-v2" });
+      const llm = new LlamaCpp({ embedModel: "nvidia/nemotron-3-embed-1b" });
       await llm.embed("hello", { isQuery: true });
       const [, init] = fetchMock.mock.calls[0]!;
       expect(JSON.parse((init as RequestInit).body as string)).toEqual({
-        model: "nvidia/llama-nemotron-embed-1b-v2",
+        model: "nvidia/nemotron-3-embed-1b",
         input: ["hello"],
         input_type: "query",
       });
@@ -796,7 +796,7 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
   });
 
   test("external embedding token counting does not load a local tokenizer", async () => {
-    const llm = new LlamaCpp({ embedModel: "nvidia/llama-nemotron-embed-1b-v2" }) as any;
+    const llm = new LlamaCpp({ embedModel: "nvidia/nemotron-3-embed-1b" }) as any;
     llm.ensureEmbedContext = vi.fn(async () => {
       throw new Error("should not load local tokenizer");
     });

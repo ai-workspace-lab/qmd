@@ -559,12 +559,20 @@ by default. Configure it with:
 ```sh
 export NVIDIA_API_KEY="..."
 export QMD_EMBED_API_BASE_URL="https://integrate.api.nvidia.com/v1"
-export QMD_EMBED_MODEL="nvidia/llama-nemotron-embed-1b-v2"
+export QMD_EMBED_MODEL="nvidia/nemotron-3-embed-1b"
 ```
 
 QMD reads `NVIDIA_API_KEY` when `QMD_EMBED_API_KEY` is not set and sends
 NVIDIA's required `input_type` automatically (`passage` while indexing, `query`
 while searching).
+
+The default `nvidia/nemotron-3-embed-1b` returns fixed **2048-dimensional**
+vectors (it replaced `nvidia/llama-nemotron-embed-1b-v2`, which NVIDIA retired
+on 2026-08-25). sqlite-vec stores them as-is. With `QMD_BACKEND=pg`, pgvector's
+HNSW index only supports `vector` up to 2000 dimensions, so the memory bridge
+switches the embedding column to `halfvec(N)` with `halfvec_cosine_ops` when
+N > 2000 (see `ensureVectorIndex()` in `src/pg/schema-pg.ts`). Changing the
+embedding model means re-embedding everything (`qmd embed -f`).
 
 Local GGUF models are disabled by default. In the default mode QMD rejects local
 embedding model URIs, skips local query expansion, and search reranking uses RRF
@@ -1289,7 +1297,7 @@ Query ──► LLM Expansion ──► [Original, Variant 1, Variant 2]
 Models are configured in `src/llm.ts`:
 
 ```typescript
-const DEFAULT_EMBED_MODEL = "nvidia/llama-nemotron-embed-1b-v2";
+const DEFAULT_EMBED_MODEL = "nvidia/nemotron-3-embed-1b";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 ```
@@ -1301,7 +1309,7 @@ In this fork the embedding default is the external NVIDIA API (see "Models" abov
 
 ```yaml
 models:
-  embed: nvidia/llama-nemotron-embed-1b-v2
+  embed: nvidia/nemotron-3-embed-1b
   # Optional local models, used only when QMD_ENABLE_LOCAL_MODELS=1:
   # rerank: hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf
   # generate: hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf
