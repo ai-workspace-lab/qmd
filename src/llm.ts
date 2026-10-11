@@ -88,6 +88,15 @@ import { createRequire } from "node:module";
  * Detect if a model URI uses the Qwen3-Embedding format.
  * Qwen3-Embedding uses a different prompting style than nomic/embeddinggemma.
  */
+/**
+ * External (non-local) embedding models such as nvidia/nemotron-3-embed-1b get
+ * raw text. The nomic-style "task: … | query:" prefixes are for embeddinggemma;
+ * measured on nemotron-3-embed-1b they narrowed the relevant/irrelevant margin.
+ */
+export function usesRawEmbeddingText(modelUri: string): boolean {
+  return !isLocalEmbeddingModel(modelUri);
+}
+
 export function isQwen3EmbeddingModel(modelUri: string): boolean {
   return /qwen.*embed/i.test(modelUri) || /embed.*qwen/i.test(modelUri);
 }
@@ -102,6 +111,11 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
   if (isQwen3EmbeddingModel(uri)) {
     return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
   }
+  if (usesRawEmbeddingText(uri)) {
+    // External API models (NVIDIA nemotron, OpenAI-compatible) take raw text;
+    // NVIDIA distinguishes query/passage via the request's input_type instead.
+    return query;
+  }
   return `task: search result | query: ${query}`;
 }
 
@@ -112,8 +126,8 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
  */
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
-  if (isQwen3EmbeddingModel(uri)) {
-    // Qwen3-Embedding: documents are raw text, no task prefix
+  if (isQwen3EmbeddingModel(uri) || usesRawEmbeddingText(uri)) {
+    // Qwen3-Embedding and external API models: raw text, no task prefix
     return title ? `${title}\n${text}` : text;
   }
   return `title: ${title || "none"} | text: ${text}`;

@@ -557,19 +557,27 @@ describe("Document Helpers", () => {
 // =============================================================================
 
 describe("Embedding Formatting", () => {
-  test("formatQueryForEmbedding adds search task prefix", () => {
-    const formatted = formatQueryForEmbedding("how to deploy");
+  const GEMMA = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+
+  test("formatQueryForEmbedding adds search task prefix (embeddinggemma)", () => {
+    const formatted = formatQueryForEmbedding("how to deploy", GEMMA);
     expect(formatted).toBe("task: search result | query: how to deploy");
   });
 
-  test("formatDocForEmbedding adds title and text prefix", () => {
-    const formatted = formatDocForEmbedding("Some content", "My Title");
+  test("formatDocForEmbedding adds title and text prefix (embeddinggemma)", () => {
+    const formatted = formatDocForEmbedding("Some content", "My Title", GEMMA);
     expect(formatted).toBe("title: My Title | text: Some content");
   });
 
-  test("formatDocForEmbedding handles missing title", () => {
-    const formatted = formatDocForEmbedding("Some content");
+  test("formatDocForEmbedding handles missing title (embeddinggemma)", () => {
+    const formatted = formatDocForEmbedding("Some content", undefined, GEMMA);
     expect(formatted).toBe("title: none | text: Some content");
+  });
+
+  test("external API models (default nemotron) get raw text", () => {
+    expect(formatQueryForEmbedding("how to deploy", "nvidia/nemotron-3-embed-1b")).toBe("how to deploy");
+    expect(formatDocForEmbedding("Some content", "My Title", "nvidia/nemotron-3-embed-1b")).toBe("My Title\nSome content");
+    expect(formatDocForEmbedding("Some content", undefined, "nvidia/nemotron-3-embed-1b")).toBe("Some content");
   });
 });
 
