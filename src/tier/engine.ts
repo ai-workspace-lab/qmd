@@ -1239,7 +1239,8 @@ export class TierEngine {
   async getSummary(period: "day" | "week" | "month", periodStart?: string, scope = "*") {
     return this.client.queryOne<{ period: string; period_start: string; scope: string; body: string; item_ids: string[] }>(
       `SELECT period, period_start::text, scope, body, item_ids::text[] FROM mem_summary
-       WHERE period = $1 AND scope = $2 ${periodStart ? "AND period_start = $3::date" : ""}
+       WHERE period = $1 AND scope = $2
+         ${periodStart ? "AND period_start <= $3::date AND $3::date < period_start + (CASE period WHEN 'day' THEN interval '1 day' WHEN 'week' THEN interval '7 days' ELSE interval '1 month' END)" : ""}
        ORDER BY period_start DESC LIMIT 1`,
       periodStart ? [period, scope, periodStart] : [period, scope],
     );
