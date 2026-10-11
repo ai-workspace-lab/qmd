@@ -8,7 +8,12 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { openDatabase, loadSqliteVec } from "../src/db.js";
 import type { Database } from "../src/db.js";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../src/llm";
+import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, usesRawEmbeddingText, DEFAULT_EMBED_MODEL_URI } from "../src/llm";
+
+// Fixture vector width must match the default embed model so the non-CI
+// searchVec tests can query it: local embeddinggemma = 768, the default
+// external nvidia/nemotron-3-embed-1b = 2048. Override with QMD_TEST_EMBED_DIMS.
+const TEST_VEC_DIMS = Number(process.env.QMD_TEST_EMBED_DIMS) || (usesRawEmbeddingText(DEFAULT_EMBED_MODEL_URI) ? 2048 : 768);
 import { unlinkSync } from "node:fs";
 import { mkdtemp, writeFile, readdir, unlink, rmdir } from "node:fs/promises";
 import { join } from "node:path";
@@ -103,7 +108,7 @@ function initTestDatabase(db: Database): void {
   `);
 
   // Create vector table
-  db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vectors_vec USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[768] distance_metric=cosine)`);
+  db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vectors_vec USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[${TEST_VEC_DIMS}] distance_metric=cosine)`);
 
   // Store collections — makes the DB self-contained
   db.exec(`
@@ -181,8 +186,8 @@ function seedTestData(db: Database): void {
   }
 
   // Add embeddings for vector search
-  const embedding = new Float32Array(768);
-  for (let i = 0; i < 768; i++) embedding[i] = Math.random();
+  const embedding = new Float32Array(TEST_VEC_DIMS);
+  for (let i = 0; i < TEST_VEC_DIMS; i++) embedding[i] = Math.random();
 
   for (const doc of docs.slice(0, 4)) { // Skip large file for embeddings
     db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at) VALUES (?, 0, 0, ?, ?, ?)`).run(doc.hash, DEFAULT_EMBED_MODEL, getEmbeddingFingerprint(DEFAULT_EMBED_MODEL), now);
