@@ -178,9 +178,14 @@ export const MEM_SCHEMA_STATEMENTS: string[] = [
 
 /** Create (or verify) every `mem_*` table. Safe to call repeatedly. */
 export async function bootstrapMemSchema(client: PgClient): Promise<void> {
-  for (const sql of MEM_SCHEMA_STATEMENTS) {
-    await client.exec(sql);
-  }
+  // Serialize concurrent bootstraps (CLI + MCP daemon starting together):
+  // parallel CREATE TABLE IF NOT EXISTS can still race on pg_type.
+  await client.tx(async (tx) => {
+    await tx.exec("SELECT pg_advisory_xact_lock(hashtext('qmd_mem_schema'))");
+    for (const sql of MEM_SCHEMA_STATEMENTS) {
+      await tx.exec(sql);
+    }
+  });
 }
 
 export const MEM_TABLES = [

@@ -155,19 +155,29 @@ export class QmdL1Index implements L1Index {
   private storePromise?: Promise<import("../index.js").QMDStore>;
 
   constructor(
-    private opts: { dbPath: string; configPath?: string; collection: string; l1Dir: string },
+    private opts: {
+      dbPath: string;
+      configPath?: string;
+      collection: string;
+      l1Dir: string;
+      /** Reuse an already-open store (MCP server); close() then leaves it open. */
+      store?: import("../index.js").QMDStore;
+    },
   ) {}
 
   private store() {
     if (!this.storePromise) {
       this.storePromise = (async () => {
-        const { createStore } = await import("../index.js");
-        mkdirSync(dirname(this.opts.dbPath), { recursive: true });
         mkdirSync(this.opts.l1Dir, { recursive: true });
-        const store = await createStore({
-          dbPath: this.opts.dbPath,
-          ...(this.opts.configPath && existsSync(this.opts.configPath) ? { configPath: this.opts.configPath } : {}),
-        });
+        let store = this.opts.store;
+        if (!store) {
+          const { createStore } = await import("../index.js");
+          mkdirSync(dirname(this.opts.dbPath), { recursive: true });
+          store = await createStore({
+            dbPath: this.opts.dbPath,
+            ...(this.opts.configPath && existsSync(this.opts.configPath) ? { configPath: this.opts.configPath } : {}),
+          });
+        }
         const cols = await store.listCollections();
         if (!cols.some((c) => c.name === this.opts.collection)) {
           await store.addCollection(this.opts.collection, { path: this.opts.l1Dir, pattern: "**/*.md" });
@@ -216,7 +226,7 @@ export class QmdL1Index implements L1Index {
   async close(): Promise<void> {
     if (this.storePromise) {
       const s = await this.storePromise;
-      await s.close();
+      if (!this.opts.store) await s.close();
       this.storePromise = undefined;
     }
   }

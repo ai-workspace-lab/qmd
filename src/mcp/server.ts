@@ -43,6 +43,8 @@ import {
   type ContextBridge,
 } from "../pg/index.js";
 import { registerContextTools } from "./context-tools.js";
+import { registerMemTools } from "./mem-tools.js";
+import { openTierEngine, type TierEngine } from "../tier/index.js";
 import { handleAgentIngest, INGEST_PATH } from "./agent-ingest.js";
 import { handleAgentRead, isAgentReadPath, bearerMatches } from "./agent-read.js";
 
@@ -189,6 +191,7 @@ async function createMcpServer(
   memory?: MemoryBridge,
   task?: TaskBridge,
   context?: ContextBridge,
+  tier?: TierEngine,
 ): Promise<McpServer> {
   // Wraps request handlers so a stdio EOF shutdown can wait for in-flight
   // work to settle before disposing the store/llm underneath it.
@@ -616,6 +619,9 @@ Intent-aware lex (C++ performance, not sports):
   }
   if (context) {
     registerContextTools(server, context, task?.scope ?? resolveScope());
+  }
+  if (tier) {
+    registerMemTools(server, tier);
   }
 
   return server;
@@ -1172,11 +1178,12 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
   const memory = await maybeOpenMemoryBridge();
   const task = await maybeOpenTaskBridge();
   const context = await maybeOpenContextBridge();
+  const tier = await maybeOpenTierEngine(store);
   const inflight = createInflightGate();
   // serveStdio dual-speaks 2026-07-28 and 2025-era clients on one connection
   // (opening exchange pins the era). A hand-wired StdioServerTransport would
   // stay 2025-only even on SDK 2.x.
-  const handle = serveStdio(() => createMcpServer(store, inflight, memory, task, context));
+  const handle = serveStdio(() => createMcpServer(store, inflight, memory, task, context, tier));
 
   // Follow the parent's lifecycle: when stdin reaches EOF the client is gone
   // and the server must exit instead of orphaning to PID 1 (#751). No
@@ -1191,6 +1198,7 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
       if (memory) await memory.dispose();
       if (task) await task.dispose();
       if (context) await context.dispose();
+      if (tier) await tier.close();
     },
   });
 }
@@ -1219,6 +1227,20 @@ async function maybeOpenContextBridge(): Promise<ContextBridge | undefined> {
   } catch (err) {
     // Same fail-open stance as coordination: no shared context, still an agent.
     console.error(`[qmd:mcp] shared task context disabled: ${(err as Error).message}`);
+    return undefined;
+  }
+}
+
+/**
+ * Three-tier memory engine (mem_* tools). Opt out with QMD_MEM_TIERS=0. The L1
+ * hot collection lives in this server's own store, so no second SQLite handle.
+ */
+async function maybeOpenTierEngine(store: QMDStore): Promise<TierEngine | undefined> {
+  if (!isPgBackend() || process.env.QMD_MEM_TIERS === "0") return undefined;
+  try {
+    return await openTierEngine({ l1Store: store });
+  } catch (err) {
+    console.error(`[qmd:mcp] tiered memory disabled: ${(err as Error).message}`);
     return undefined;
   }
 }
@@ -1301,13 +1323,14 @@ export async function startMcpHttpServer(
   // ingest endpoint that xworkmate-bridge forwards web/mobile contributions to.
   const context = await maybeOpenContextBridge();
   const ingestToken = process.env.QMD_INGEST_TOKEN?.trim() || undefined;
+  const tier = await maybeOpenTierEngine(store);
 
   // Official 2026-07-28 HTTP entry: one factory, per-request instance, JSON
   // responses (matches the previous enableJsonResponse: true). Dual-speaks
   // 2025-era traffic statelessly by default (`legacy: "stateless"`).
   // Fork: the per-request instances share the PG bridges opened above.
   const mcpHandler = createMcpHandler(
-    () => createMcpServer(store, undefined, memory, task, context),
+    () => createMcpServer(store, undefined, memory, task, context, tier),
     { responseMode: "json" },
   );
 
@@ -1549,6 +1572,7 @@ export async function startMcpHttpServer(
     if (memory) await memory.dispose();
     if (task) await task.dispose();
     if (context) await context.dispose();
+    if (tier) await tier.close();
   };
 
   process.on("SIGTERM", async () => {

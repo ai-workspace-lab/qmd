@@ -144,6 +144,17 @@ export class TierEngine {
     }
     const sha = sha256Hex(redacted ?? body);
 
+    // Index the redacted text too, so a pasted token costs a masked value
+    // rather than a whole dropped part. Parts that still match findSecret
+    // after redaction are dropped in writeParts.
+    let indexBody = body;
+    if (redacted !== null && input.raw === undefined) {
+      indexBody = stripFrontmatter(redacted).trim();
+    } else if (!input.skipL3) {
+      const rb = this.redactor(body);
+      if (!rb.residual.length) indexBody = rb.text.trim();
+    }
+
     const existing = await this.client.queryOne<{ id: string; sha256: string; parts: number; tier_state: string }>(
       `SELECT id, sha256, parts, tier_state FROM mem_item WHERE source = $1 AND source_ref = $2`,
       [input.source, input.sourceRef],
@@ -187,14 +198,14 @@ export class TierEngine {
     let parts = existing?.parts ?? 0;
     let dropped = 0;
     if (!unchanged) {
-      const res = await this.writeParts(id, input.title ?? null, body, {
+      const res = await this.writeParts(id, input.title ?? null, indexBody, {
         kind: input.kind,
         source: input.source,
         scope: input.scope ?? null,
       });
       parts = res.parts;
       dropped = res.dropped;
-      const summary = input.summary ?? (await this.summarizer.summarize({ title: input.title ?? null, body, kind: input.kind }));
+      const summary = input.summary ?? (await this.summarizer.summarize({ title: input.title ?? null, body: indexBody, kind: input.kind }));
       await this.writeSummary(id, input.title ?? null, summary);
       await this.client.exec(
         `UPDATE mem_item SET parts = $2, summary = $3, tier_state = 'l2_full', compacted_at = NULL, updated_at = now() WHERE id = $1`,

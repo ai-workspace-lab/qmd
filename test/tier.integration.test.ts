@@ -183,6 +183,32 @@ describe.skipIf(!PG_URL)("TierEngine (integration)", () => {
     await expect(engine.remember({ title: "t", body: `here ${secret}` })).rejects.toThrow(/secret/);
   });
 
+  test("redacting redactor: masked value keeps the part indexed (no drop)", async () => {
+    if (!engine) return;
+    const masking = new TierEngine({
+      client: client!,
+      embedder: stub,
+      l1: null,
+      redactor: (text: string) => ({
+        text: text.replace(/nvapi-[A-Za-z0-9_-]{20,}/g, "[REDACTED:nvapi]"),
+        counts: { nvapi: (text.match(/nvapi-[A-Za-z0-9_-]{20,}/g) ?? []).length },
+        residual: [],
+      }),
+      now: () => clock,
+      config: engine.config,
+    });
+    const fake = "nvapi-" + "Q".repeat(32);
+    const r = await masking.upsertItem({
+      kind: "session", source: "redact", sourceRef: "r1", title: "redaction check",
+      occurredAt: clock, body: `export NVIDIA_KEY_VALUE ${fake}\nthen ran the embedding probe for walrus`,
+    });
+    expect(r.droppedParts).toBe(0);
+    expect(r.parts).toBeGreaterThan(0);
+    const body = await masking.itemBody(r.id);
+    expect(body).toContain("[REDACTED:nvapi]");
+    expect(body).not.toContain(fake);
+  });
+
   test("write-through: remember → L3 staged + L2 + L1, search finds it in L1", async () => {
     if (!engine) return;
     const r = await engine.remember({ title: "Deploy note", body: "We deploy the memory MCP on port 8181 with bun.", agent: "test" });

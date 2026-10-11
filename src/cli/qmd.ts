@@ -133,6 +133,7 @@ import {
   type SensitiveSnapshot,
 } from "../trust.js";
 import { runMemoryCommand, runPgCommand, runTaskCommand, runCtxCommand } from "./pg-commands.js";
+import { runTierCommand } from "./tier-commands.js";
 
 // NOTE: enableProductionMode() is intentionally NOT called at module scope here.
 // Importing this module for its exports (e.g. buildEditorUri, termLink from
@@ -3105,6 +3106,21 @@ function parseCLI() {
       next: { type: "string" },       // next action for a handoff
       key: { type: "string" },        // item key (plan stepKey / decision memoryKey)
       detail: { type: "string" },     // path action or question resolution
+      // Tiered memory (qmd tier) options
+      kind: { type: "string" },       // mem item kind
+      reason: { type: "string" },     // forget reason
+      evidence: { type: "string" },   // comma-separated mem_item ids
+      date: { type: "string" },       // YYYY-MM-DD
+      until: { type: "string" },      // timeline end
+      entity: { type: "string" },     // fact subject
+      predicate: { type: "string" },  // fact predicate
+      object: { type: "string" },     // fact object
+      type: { type: "string" },       // entity type
+      budget: { type: "string" },     // context token budget
+      batch: { type: "string" },      // embed batch size
+      max: { type: "string" },        // embed max items
+      delay: { type: "string" },      // embed delay between batches (ms)
+      generate: { type: "boolean" },  // summary --generate
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -3611,6 +3627,7 @@ function showHelp(): void {
   console.log("  qmd pg status                 - Show PostgreSQL memory backend health");
   console.log("  qmd task claim/who/release    - Multi-agent coordination (needs QMD_BACKEND=pg)");
   console.log("  qmd ctx collect/threads/brief - Shared task context across agent clients (needs QMD_BACKEND=pg)");
+  console.log("  qmd tier search/recall/remember/context/facts/status - Three-tier memory L1/L2/L3 (needs QMD_BACKEND=pg; see qmd tier help)");
   console.log("  qmd sync [--dry-run]          - Secure two-way sync with a remote QMD host");
   console.log("  qmd bench <fixture.json>      - Run search quality benchmarks against a fixture file");
   console.log("");
@@ -5074,6 +5091,11 @@ if (isMain) {
 
     case "ctx": {
       const code = await runCtxCommand(cli.args, cli.values);
+      process.exit(code);
+    }
+
+    case "tier": {
+      const code = await runTierCommand(cli.args, cli.values);
       process.exit(code);
     }
 

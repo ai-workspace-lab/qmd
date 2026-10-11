@@ -66,6 +66,8 @@ export interface OpenTierOptions {
   /** Skip the embedder (lexical-only; used by status and tests). */
   noEmbedder?: boolean;
   noL1?: boolean;
+  /** Existing QMD store to host the L1 "hot" collection (MCP server shares its own). */
+  l1Store?: import("../index.js").QMDStore;
 }
 
 export async function openTierEngine(opts: OpenTierOptions = {}): Promise<TierEngine> {
@@ -77,7 +79,7 @@ export async function openTierEngine(opts: OpenTierOptions = {}): Promise<TierEn
   const client = await PgClient.create(pg);
   await bootstrapSchema(client);
   const config = resolveTierConfig(env);
-  const embedder = opts.noEmbedder
+  const embedder = opts.noEmbedder || env.MEM_NO_EMBED === "1"
     ? null
     : new LlamaCpp({ inactivityTimeoutMs: 5 * 60 * 1000, disposeModelsOnInactivity: true });
   const l1 = opts.noL1 || env.MEM_NO_L1 === "1"
@@ -87,6 +89,7 @@ export async function openTierEngine(opts: OpenTierOptions = {}): Promise<TierEn
         configPath: join(getConfigDir(), "index.yml"),
         collection: env.MEM_L1_COLLECTION || "hot",
         l1Dir: config.l1Dir,
+        ...(opts.l1Store ? { store: opts.l1Store } : {}),
       });
   const engine = new TierEngine({
     client,
