@@ -36,7 +36,7 @@ describe.skipIf(!PG_URL)("PgMemoryStore (integration)", () => {
   let store: PgMemoryStore;
 
   beforeAll(async () => {
-    const config = { ...resolvePgConfig({ QMD_PG_URL: PG_URL!, QMD_NAMESPACE: NS }) };
+    const config = { ...resolvePgConfig({ QMD_PG_URL: PG_URL!, QMD_NAMESPACE: NS, ...(process.env.QMD_PG_SSL ? { QMD_PG_SSL: process.env.QMD_PG_SSL } : {}) }) };
     store = await PgMemoryStore.open(config, stubEmbedder);
   });
 
