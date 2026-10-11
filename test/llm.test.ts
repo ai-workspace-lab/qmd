@@ -33,6 +33,7 @@ import {
   withLLMSession,
   canUnloadLLM,
   SessionReleasedError,
+  defaultVectorMinScore,
   type RerankDocument,
   type ILLMSession,
 } from "../src/llm.js";
@@ -693,6 +694,7 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
         model: "nvidia/nemotron-3-embed-1b",
         input: ["hello"],
         input_type: "passage",
+        truncate: "END",
       });
       expect(result).toEqual({
         embedding: [0.1, 0.2, 0.3],
@@ -734,6 +736,7 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
         model: "nvidia/nemotron-3-embed-1b",
         input: ["hello"],
         input_type: "query",
+        truncate: "END",
       });
     } finally {
       fetchMock.mockRestore();
@@ -744,6 +747,48 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
       if (prevBaseUrl === undefined) delete process.env.QMD_EMBED_API_BASE_URL;
       else process.env.QMD_EMBED_API_BASE_URL = prevBaseUrl;
     }
+  });
+
+  test("external embedding retries 429 and splits large batches", async () => {
+    const saved = { ...process.env };
+    process.env.QMD_EMBED_API_KEY = "test-key";
+    process.env.QMD_EMBED_API_BATCH = "2";
+    process.env.QMD_EMBED_API_RETRY_MS = "1";
+    delete process.env.QMD_EMBED_API_BASE_URL;
+    let calls = 0;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      calls++;
+      if (calls === 1) {
+        return { ok: false, status: 429, statusText: "Too Many Requests", headers: new Headers(), text: async () => "" } as Response;
+      }
+      const input = JSON.parse((init as RequestInit).body as string).input as string[];
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({ model: "m", data: input.map((t, i) => ({ index: i, embedding: [t.length] })) }),
+      } as unknown as Response;
+    });
+    try {
+      const llm = new LlamaCpp({ embedModel: "nvidia/nemotron-3-embed-1b" });
+      const out = await llm.embedBatch(["a", "bb", "ccc"]);
+      expect(out.map((r) => r?.embedding[0])).toEqual([1, 2, 3]);
+      // 1 rate-limited attempt + 2 batches (2 + 1 inputs)
+      expect(calls).toBe(3);
+    } finally {
+      fetchMock.mockRestore();
+      for (const k of ["QMD_EMBED_API_KEY", "QMD_EMBED_API_BATCH", "QMD_EMBED_API_RETRY_MS", "QMD_EMBED_API_BASE_URL"]) {
+        if (saved[k] === undefined) delete process.env[k];
+        else process.env[k] = saved[k];
+      }
+    }
+  });
+
+  test("defaultVectorMinScore is lower for external models and honors env", () => {
+    expect(defaultVectorMinScore("hf:ggml-org/embeddinggemma-300M-GGUF/x.gguf", {})).toBe(0.3);
+    expect(defaultVectorMinScore("nvidia/nemotron-3-embed-1b", {})).toBe(0.1);
+    expect(defaultVectorMinScore("nvidia/nemotron-3-embed-1b", { QMD_VSEARCH_MIN_SCORE: "0" })).toBe(0);
+    expect(defaultVectorMinScore("nvidia/nemotron-3-embed-1b", { QMD_VSEARCH_MIN_SCORE: "0.25" })).toBe(0.25);
   });
 
   test("hf embedding model opts into local embedding", () => {

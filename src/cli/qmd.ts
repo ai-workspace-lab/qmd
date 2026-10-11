@@ -86,7 +86,7 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive, defaultVectorMinScore } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -2856,7 +2856,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
     let results = await vectorSearchQuery(store, query, {
       collection: collectionSearchFilter(collectionNames),
       limit: opts.all ? 500 : (opts.limit || 10),
-      minScore: opts.minScore || 0.3,
+      minScore: opts.minScore,
       intent: opts.intent,
       hooks: {
         onExpand: (original, expanded) => {
@@ -3161,7 +3161,7 @@ function parseCLI() {
     format,
     full: !!values.full,
     limit: isAll ? 100000 : (values.n ? parseInt(String(values.n), 10) || defaultLimit : defaultLimit),
-    minScore: values["min-score"] ? parseFloat(String(values["min-score"])) || 0 : 0,
+    minScore: values["min-score"] !== undefined ? parseFloat(String(values["min-score"])) || 0 : 0,
     all: isAll,
     collection: values.collection as string[] | undefined,
     lineNumbers: !!values["line-numbers"],
@@ -4802,9 +4802,11 @@ if (isMain) {
         console.error("Usage: qmd vsearch [options] <query>");
         process.exit(1);
       }
-      // Default min-score for vector search is 0.3
-      if (!cli.values["min-score"]) {
-        cli.opts.minScore = 0.3;
+      // Default min-score depends on the embed model (0.3 for local
+      // embeddinggemma, lower for external models whose cosine scores run
+      // lower). An explicit --min-score (including 0) is always honored.
+      if (cli.values["min-score"] === undefined) {
+        cli.opts.minScore = defaultVectorMinScore(resolveModelsForCli().embed);
       }
       await resolveLocalConfigTrust();
       await vectorSearch(cli.query, cli.opts);

@@ -93,6 +93,23 @@ import { createRequire } from "node:module";
  * raw text. The nomic-style "task: … | query:" prefixes are for embeddinggemma;
  * measured on nemotron-3-embed-1b they narrowed the relevant/irrelevant margin.
  */
+/**
+ * Default `qmd vsearch` similarity floor for an embedding model.
+ *
+ * The 0.3 floor was tuned for local embeddinggemma, whose cosine scores run
+ * high. External models such as nvidia/nemotron-3-embed-1b produce lower
+ * absolute similarities (good matches typically 0.25-0.5), so a 0.3 floor
+ * hides relevant hits. QMD_VSEARCH_MIN_SCORE overrides both defaults.
+ */
+export function defaultVectorMinScore(modelUri: string, env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.QMD_VSEARCH_MIN_SCORE;
+  if (raw !== undefined && raw.trim() !== "") {
+    const v = Number.parseFloat(raw);
+    if (Number.isFinite(v) && v >= 0) return v;
+  }
+  return isLocalEmbeddingModel(modelUri) ? 0.3 : 0.1;
+}
+
 export function usesRawEmbeddingText(modelUri: string): boolean {
   return !isLocalEmbeddingModel(modelUri);
 }
@@ -1518,19 +1535,56 @@ export class LlamaCpp implements LLM {
       );
     }
 
-    const response = await fetch(`${this.embedApiBaseUrl}/embeddings`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${this.embedApiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model,
-        input: texts,
-        ...(this.isNvidiaEmbedApi() ? { input_type: options.isQuery ? "query" : "passage" } : {}),
-      }),
+    // Large inputs are split into API-sized batches (QMD_EMBED_API_BATCH,
+    // default 64) so bulk re-embeds stay within provider request limits.
+    const batchSize = Math.max(1, Number.parseInt(process.env.QMD_EMBED_API_BATCH ?? "", 10) || 64);
+    if (texts.length > batchSize) {
+      const out: (EmbeddingResult | null)[] = [];
+      for (let i = 0; i < texts.length; i += batchSize) {
+        out.push(...await this.embedExternal(texts.slice(i, i + batchSize), model, options));
+      }
+      return out;
+    }
+
+    const nvidia = this.isNvidiaEmbedApi();
+    const requestBody = JSON.stringify({
+      model,
+      input: texts,
+      ...(nvidia ? { input_type: options.isQuery ? "query" : "passage", truncate: "END" } : {}),
     });
 
+    // Retry rate limits (429) and transient server/network errors with
+    // exponential backoff, honoring Retry-After when the provider sends it.
+    const maxAttempts = Math.max(1, Number.parseInt(process.env.QMD_EMBED_API_RETRIES ?? "", 10) || 5);
+    const baseDelayMs = Math.max(0, Number.parseInt(process.env.QMD_EMBED_API_RETRY_MS ?? "", 10) || 1000);
+    let response: Response | undefined;
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        response = await fetch(`${this.embedApiBaseUrl}/embeddings`, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${this.embedApiKey}`,
+            "Content-Type": "application/json",
+          },
+          body: requestBody,
+        });
+      } catch (err) {
+        lastError = err;
+        response = undefined;
+      }
+      const retryable = !response || response.status === 429 || response.status >= 500;
+      if (!retryable || attempt === maxAttempts) break;
+      const retryAfter = Number.parseFloat(response?.headers.get("retry-after") ?? "");
+      const delay = Number.isFinite(retryAfter) && retryAfter > 0
+        ? retryAfter * 1000
+        : baseDelayMs * 2 ** (attempt - 1);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+
+    if (!response) {
+      throw new Error(`Embedding API request failed: ${(lastError as Error)?.message ?? String(lastError)}`);
+    }
     if (!response.ok) {
       const body = await response.text().catch(() => "");
       throw new Error(`Embedding API request failed: ${response.status} ${response.statusText}${body ? `\n${body}` : ""}`);
