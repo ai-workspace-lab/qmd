@@ -116,7 +116,22 @@ import {
   type CollectionConfig,
   type ModelsConfig,
 } from "../collections.js";
-import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
+import {
+  decideLocalConfigGate,
+  gatedItems,
+  hasGatedItems,
+  isCollectionPathInsideProject,
+  isLocalConfigPath,
+  isLocalConfigTrustOptedIn,
+  isTrusted,
+  listTrusted,
+  recordTrust,
+  revokeTrust,
+  sensitiveDigest,
+  type BuiltinModels,
+  type GatedItems,
+  type SensitiveSnapshot,
+} from "../trust.js";
 import { runMemoryCommand, runPgCommand, runTaskCommand, runCtxCommand } from "./pg-commands.js";
 
 // NOTE: enableProductionMode() is intentionally NOT called at module scope here.
@@ -648,9 +663,9 @@ async function showStatus(): Promise<void> {
     };
     const activeModels = resolveModelsForCli();
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
-    console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)} ${c.dim}(optional; set QMD_ENABLE_LOCAL_MODELS=1)${c.reset}`);
-    console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)} ${c.dim}(optional; set QMD_ENABLE_LOCAL_MODELS=1)${c.reset}`);
+    console.log(`  Embedding:   ${hfLink(activeModels.embed)}`);
+    console.log(`  Reranking:   ${hfLink(activeModels.rerank)} ${c.dim}(optional; set QMD_ENABLE_LOCAL_MODELS=1)${c.reset}`);
+    console.log(`  Generation:  ${hfLink(activeModels.generate)} ${c.dim}(optional; set QMD_ENABLE_LOCAL_MODELS=1)${c.reset}`);
   }
 
 
@@ -3068,7 +3083,6 @@ function parseCLI() {
       "remote-user": { type: "string" },
       "remote-qmd-user": { type: "string" },
       "remote-home": { type: "string" },
-      "dry-run": { type: "boolean" },
       delete: { type: "boolean" },
       update: { type: "boolean" },
       embed: { type: "boolean" },
@@ -3613,7 +3627,9 @@ function showHelp(): void {
   console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
-  console.log("  qmd cleanup                   - Clear caches, vacuum DB");
+  console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30)");
+  console.log("  qmd pull [--refresh] [--progress] - Download embedding/generation/rerank models");
+  console.log("  qmd cleanup [--dry-run]       - Drop inactive docs/orphans, compact FTS, vacuum");
   console.log("  qmd sync --dry-run            - Preview SSH/rsync sync against the default remote");
   console.log("");
   console.log("Query syntax (qmd query):");
@@ -4748,12 +4764,15 @@ if (isMain) {
     case "pull": {
       await resolveLocalConfigTrust();
       const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
+      const activeModels = resolveModelsForRuntime();
+      // ai-workspace-lab fork: only local (hf:/.gguf/path) models are pullable;
+      // the external embedding API model is skipped.
       const isLocalModelUri = (uri: string) =>
         uri.startsWith("hf:") || uri.endsWith(".gguf") || uri.startsWith("/") || uri.startsWith("./") || uri.startsWith("../");
       const models = [
-        DEFAULT_EMBED_MODEL_URI,
-        DEFAULT_GENERATE_MODEL_URI,
-        DEFAULT_RERANK_MODEL_URI,
+        activeModels.embed,
+        activeModels.generate,
+        activeModels.rerank,
       ].filter(isLocalModelUri);
       console.log(`${c.bold}Pulling models${c.reset}`);
       const results = await pullModels(models, {

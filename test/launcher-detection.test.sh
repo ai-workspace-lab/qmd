@@ -26,9 +26,15 @@ detect_runtime() {
     echo "node"
   elif [ -f "$DIR/bun.lock" ] || [ -f "$DIR/bun.lockb" ]; then
     echo "bun"
-  elif [[ "$BUN_AVAILABLE" == "1" ]]; then
+  elif [[ "$DIR" == */node_modules/* ]] && [ -f "${DIR%/node_modules/*}/package-lock.json" ]; then
+    # Mirror the install-root fallback: package-manager installs keep their
+    # lockfile above node_modules/, never inside the package directory.
+    echo "node"
+  elif [[ "$DIR" == */node_modules/* ]] && { [ -f "${DIR%/node_modules/*}/bun.lock" ] || [ -f "${DIR%/node_modules/*}/bun.lockb" ]; }; then
     echo "bun"
-  elif [[ "$HOME_BUN_AVAILABLE" == "1" ]]; then
+  elif [[ "$DIR" != */node_modules/* ]] && [[ "$BUN_AVAILABLE" == "1" ]]; then
+    echo "bun"
+  elif [[ "$DIR" != */node_modules/* ]] && [[ "$HOME_BUN_AVAILABLE" == "1" ]]; then
     echo "home-bun"
   else
     echo "node"
@@ -51,7 +57,7 @@ echo "=== bin/qmd runtime detection tests ==="
 
 # --- Test cases ---
 
-# 1. No lockfiles → default to bun when bun is available
+# 1. No lockfiles → default to bun when bun is available (fork behavior)
 d="$TMPDIR_BASE/no-lockfiles"
 mkdir -p "$d"
 assert_runtime "no lockfiles + bun available → bun" "$d" "bun"

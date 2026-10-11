@@ -861,11 +861,19 @@ export class LlamaCpp implements LLM {
 
 
   constructor(config: LlamaCppConfig = {}) {
-    this.embedModelUri = config.embedModel || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL;
+    // STRUCTURAL INVARIANT: the launcher (bin/qmd) and the Nix flake wrapper
+    // set GGML_METAL_NO_RESIDENCY=1 on darwin BEFORE the native binding loads,
+    // which prevents the libggml-metal static destructor assertion at process
+    // exit (ggml-org/llama.cpp#22593). Nix installs skip bin/qmd (#723).
+    // See isDarwinMetalMitigationActive() for the runtime check exposed to
+    // diagnostics. No constructor-time guard installation is needed.
+
+    this.embedModelUri = resolveEmbedModel({ embed: config.embedModel });
+    // ai-workspace-lab fork: external OpenAI-compatible embedding API (NVIDIA NIM by default).
     this.embedApiBaseUrl = (config.embedApiBaseUrl || process.env.QMD_EMBED_API_BASE_URL || process.env.OPENAI_BASE_URL || DEFAULT_EMBED_API_BASE_URL).replace(/\/+$/, "");
     this.embedApiKey = config.embedApiKey || process.env.QMD_EMBED_API_KEY || process.env.NVIDIA_API_KEY || process.env.OPENAI_API_KEY;
-    this.generateModelUri = config.generateModel || process.env.QMD_GENERATE_MODEL || DEFAULT_GENERATE_MODEL;
-    this.rerankModelUri = config.rerankModel || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL;
+    this.generateModelUri = resolveGenerateModel({ generate: config.generateModel });
+    this.rerankModelUri = resolveRerankModel({ rerank: config.rerankModel });
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
     this.expandContextSize = resolveExpandContextSize(config.expandContextSize);
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
@@ -874,6 +882,14 @@ export class LlamaCpp implements LLM {
 
   get embedModelName(): string {
     return this.embedModelUri;
+  }
+
+  get generateModelName(): string {
+    return this.generateModelUri;
+  }
+
+  get rerankModelName(): string {
+    return this.rerankModelUri;
   }
 
   get usesLocalEmbedding(): boolean {
@@ -1699,7 +1715,7 @@ export class LlamaCpp implements LLM {
   // High-level abstractions
   // ==========================================================================
 
-  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
+  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
     if (!localModelsEnabled()) return [];
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation

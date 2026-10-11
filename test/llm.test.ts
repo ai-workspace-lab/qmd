@@ -418,8 +418,11 @@ describe("native llama stdout containment", () => {
   test("embeds hello world with QMD_FORCE_CPU=1 without throwing", async () => {
     const prevGpu = process.env.QMD_LLAMA_GPU;
     const prevForceCpu = process.env.QMD_FORCE_CPU;
+    const prevLocal = process.env.QMD_ENABLE_LOCAL_MODELS;
     process.env.QMD_FORCE_CPU = "1";
     process.env.QMD_LLAMA_GPU = "metal";
+    // Fork: embeddings default to the external API; opt into the local path.
+    process.env.QMD_ENABLE_LOCAL_MODELS = "1";
 
     const getEmbeddingFor = vi.fn(async (text: string) => ({
       vector: new Float32Array([0.1, 0.2, 0.3]),
@@ -451,7 +454,7 @@ describe("native llama stdout containment", () => {
     });
 
     const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
-    const llm = new LlamaCpp();
+    const llm = new LlamaCpp({ embedModel: "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf" });
     try {
       const result = await llm.embed("hello world");
       expect(result).toEqual({
@@ -469,6 +472,8 @@ describe("native llama stdout containment", () => {
       else process.env.QMD_LLAMA_GPU = prevGpu;
       if (prevForceCpu === undefined) delete process.env.QMD_FORCE_CPU;
       else process.env.QMD_FORCE_CPU = prevForceCpu;
+      if (prevLocal === undefined) delete process.env.QMD_ENABLE_LOCAL_MODELS;
+      else process.env.QMD_ENABLE_LOCAL_MODELS = prevLocal;
     }
   });
 });

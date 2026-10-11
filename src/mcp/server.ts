@@ -28,6 +28,7 @@ import {
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
 import { enableProductionMode } from "../store.js";
+import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
 import {
   isPgBackend,
   openMemoryBridge,
@@ -44,8 +45,6 @@ import {
 import { registerContextTools } from "./context-tools.js";
 import { handleAgentIngest, INGEST_PATH } from "./agent-ingest.js";
 import { handleAgentRead, isAgentReadPath, bearerMatches } from "./agent-read.js";
-
-enableProductionMode();
 
 // =============================================================================
 // Types for structured content
@@ -186,10 +185,14 @@ async function buildInstructions(store: QMDStore): Promise<string> {
  */
 async function createMcpServer(
   store: QMDStore,
+  inflight?: InflightGate,
   memory?: MemoryBridge,
   task?: TaskBridge,
   context?: ContextBridge,
 ): Promise<McpServer> {
+  // Wraps request handlers so a stdio EOF shutdown can wait for in-flight
+  // work to settle before disposing the store/llm underneath it.
+  const track = inflight?.track ?? (<T,>(fn: T): T => fn);
   const server = new McpServer(
     { name: "qmd", version: getPackageVersion() },
     {
@@ -628,12 +631,12 @@ function registerMemoryTools(server: McpServer, memory: MemoryBridge): void {
         "Hybrid search over shared agent memory (PostgreSQL). Fuses pg_jieba/tsvector " +
         "lexical search with pgvector semantic search via RRF. Scoped to a namespace.",
       annotations: { readOnlyHint: true, openWorldHint: false },
-      inputSchema: {
+      inputSchema: z.object({
         query: z.string().describe("Natural language or keyword query"),
         namespace: z.string().optional().describe("Tenant namespace (default: configured namespace)"),
         limit: z.number().optional().default(10).describe("Max results"),
         full: z.boolean().optional().default(false).describe("Return full body instead of a snippet"),
-      },
+      }),
     },
     async ({ query, namespace, limit, full }) => {
       const results = await memory.store.searchMemory(query, {
@@ -659,13 +662,13 @@ function registerMemoryTools(server: McpServer, memory: MemoryBridge): void {
         "Store or replace a memory in the shared PostgreSQL store. Re-adding the same " +
         "key updates it. Content is chunked, embedded, and indexed for hybrid search.",
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-      inputSchema: {
+      inputSchema: z.object({
         key: z.string().describe("Logical id within the namespace (like a path/slug)"),
         body: z.string().describe("The memory content to store and index"),
         title: z.string().optional().describe("Optional human title"),
         namespace: z.string().optional().describe("Tenant namespace (default: configured namespace)"),
         metadata: z.record(z.string(), z.unknown()).optional().describe("Arbitrary JSON metadata"),
-      },
+      }),
     },
     async ({ key, body, title, namespace, metadata }) => {
       const res = await memory.store.addMemory({
@@ -693,10 +696,10 @@ function registerMemoryTools(server: McpServer, memory: MemoryBridge): void {
       title: "Get Memory",
       description: "Fetch a single memory's full body by key from the shared PostgreSQL store.",
       annotations: { readOnlyHint: true, openWorldHint: false },
-      inputSchema: {
+      inputSchema: z.object({
         key: z.string().describe("The memory key"),
         namespace: z.string().optional().describe("Tenant namespace (default: configured namespace)"),
-      },
+      }),
     },
     async ({ key, namespace }) => {
       const rec = await memory.store.getMemory(key, namespace ? { namespace } : undefined);
@@ -716,10 +719,10 @@ function registerMemoryTools(server: McpServer, memory: MemoryBridge): void {
       title: "List Memory",
       description: "List memories in a namespace (most recently updated first).",
       annotations: { readOnlyHint: true, openWorldHint: false },
-      inputSchema: {
+      inputSchema: z.object({
         namespace: z.string().optional().describe("Tenant namespace (default: configured namespace)"),
         limit: z.number().optional().default(100).describe("Max entries"),
-      },
+      }),
     },
     async ({ namespace, limit }) => {
       const rows = await memory.store.listMemories({
@@ -769,7 +772,7 @@ function registerTaskTools(server: McpServer, task: TaskBridge): void {
         "agent holds it: coordinate, pick different work, or re-call with force=true. " +
         "Claims are advisory — they never block you, they only tell you the truth.",
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-      inputSchema: {
+      inputSchema: z.object({
         resource: z
           .string()
           .describe("Repo-relative path, or a glob like '.github/workflows/*' for an area"),
@@ -778,7 +781,7 @@ function registerTaskTools(server: McpServer, task: TaskBridge): void {
         cwd: z.string().optional().describe("Checkout directory the resource lives in"),
         ttl_seconds: z.number().optional().describe("Claim lifetime, default 1800"),
         force: z.boolean().optional().describe("Take over a live claim held by another agent"),
-      },
+      }),
     },
     async ({ resource, intent, scope, cwd, ttl_seconds, force }) => {
       const s = scopeOf(scope, cwd);
@@ -811,11 +814,11 @@ function registerTaskTools(server: McpServer, task: TaskBridge): void {
         "Check whether any agent currently holds a file or area. Cheap and read-only — " +
         "use it before editing anything you did not claim yourself.",
       annotations: { readOnlyHint: true, openWorldHint: false },
-      inputSchema: {
+      inputSchema: z.object({
         resource: z.string().describe("Repo-relative path to check"),
         scope: z.string().optional().describe("Project key; omit to derive from cwd"),
         cwd: z.string().optional().describe("Checkout directory the resource lives in"),
-      },
+      }),
     },
     async ({ resource, scope, cwd }) => {
       const holders = await task.store.who(scopeOf(scope, cwd), resource);
@@ -845,14 +848,14 @@ function registerTaskTools(server: McpServer, task: TaskBridge): void {
         "base moved underneath you while you worked, and how many of those commits " +
         "touched this file — rebase before pushing if it did.",
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-      inputSchema: {
+      inputSchema: z.object({
         resource: z.string().describe("Repo-relative path to release"),
         status: z.enum(["done", "abandoned"]).optional().describe("Default: done"),
         note: z.string().optional().describe("What you ended up doing"),
         scope: z.string().optional().describe("Project key; omit to derive from cwd"),
         cwd: z.string().optional().describe("Checkout directory the resource lives in"),
         force: z.boolean().optional().describe("Release a claim held by another agent"),
-      },
+      }),
     },
     async ({ resource, status, note, scope, cwd, force }) => {
       const released = await task.store.release(scopeOf(scope, cwd), resource, {
@@ -890,11 +893,11 @@ function registerTaskTools(server: McpServer, task: TaskBridge): void {
         "since when. Use it at the start of a session to avoid picking up work another " +
         "agent already has in flight.",
       annotations: { readOnlyHint: true, openWorldHint: false },
-      inputSchema: {
+      inputSchema: z.object({
         scope: z.string().optional().describe("Project key; omit to derive from cwd"),
         cwd: z.string().optional().describe("Checkout directory of the project"),
         include_stale: z.boolean().optional().describe("Also show TTL-lapsed claims"),
-      },
+      }),
     },
     async ({ scope, cwd, include_stale }) => {
       const s = scopeOf(scope, cwd);
@@ -923,11 +926,11 @@ function registerTaskTools(server: McpServer, task: TaskBridge): void {
         "Refresh a claim you hold so it does not lapse during long work. A claim whose " +
         "TTL expires is treated as abandoned and can be taken by another agent.",
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-      inputSchema: {
+      inputSchema: z.object({
         resource: z.string().describe("Repo-relative path you hold"),
         scope: z.string().optional().describe("Project key; omit to derive from cwd"),
         cwd: z.string().optional().describe("Checkout directory the resource lives in"),
-      },
+      }),
     },
     async ({ resource, scope, cwd }) => {
       const ok = await task.store.heartbeat(scopeOf(scope, cwd), resource, task.agentId);
@@ -1164,12 +1167,32 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
     dbPath: options.dbPath ?? getDefaultDbPath(),
     ...(existsSync(configPath) ? { configPath } : {}),
   });
+  // ai-workspace-lab fork: PG-backed memory / task coordination / shared
+  // context bridges (QMD_BACKEND=pg). One pool shared by every MCP instance.
   const memory = await maybeOpenMemoryBridge();
   const task = await maybeOpenTaskBridge();
   const context = await maybeOpenContextBridge();
-  const server = await createMcpServer(store, memory, task, context);
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  const inflight = createInflightGate();
+  // serveStdio dual-speaks 2026-07-28 and 2025-era clients on one connection
+  // (opening exchange pins the era). A hand-wired StdioServerTransport would
+  // stay 2025-only even on SDK 2.x.
+  const handle = serveStdio(() => createMcpServer(store, inflight, memory, task, context));
+
+  // Follow the parent's lifecycle: when stdin reaches EOF the client is gone
+  // and the server must exit instead of orphaning to PID 1 (#751). No
+  // disposeLlm here — store.close() disposes this store's own LlamaCpp
+  // instance, so passing the global disposeDefaultLlamaCpp would only risk
+  // tearing down an unrelated instance in an embedded process.
+  registerStdioEofShutdown({
+    closeServer: () => handle.close(),
+    waitForIdle: (timeoutMs) => inflight.waitForIdle(timeoutMs),
+    closeStore: async () => {
+      await store.close();
+      if (memory) await memory.dispose();
+      if (task) await task.dispose();
+      if (context) await context.dispose();
+    },
+  });
 }
 
 /**
@@ -1233,19 +1256,29 @@ export type HttpServerHandle = {
  * or a stdio connection). The previous session reaper (#816) is gone because
  * there are no sessions to reap.
  */
-export async function startMcpHttpServer(port: number, options?: { quiet?: boolean }): Promise<HttpServerHandle> {
-  // MCP and search over HTTP. When QMD sits behind xworkmate-bridge (remote
-  // mode) these must be authenticated: the bridge forwards with QMD_MCP_TOKEN.
-  // A daemon bound beyond loopback refuses to start without it.
+export async function startMcpHttpServer(
+  port: number,
+  options: ({ quiet?: boolean; host?: string; allowedOrigins?: string[]; allowedHosts?: string[] } & McpStartupOptions) = {},
+): Promise<HttpServerHandle> {
+  // See startMcpServer() for the rationale — flip production mode here so the
+  // HTTP transport resolves the real database path, without leaking state into
+  // callers that only import this module for its exports (e.g. tests).
+  enableProductionMode();
+
+  // ai-workspace-lab fork — remote mode. When QMD sits behind xworkmate-bridge
+  // /mcp, /query and /search must be authenticated: the bridge forwards with
+  // QMD_MCP_TOKEN. A daemon bound beyond loopback refuses to start without it.
+  // Bind host: --host, then QMD_MCP_HOST (fork), then QMD_HOST (upstream).
   const mcpToken = process.env.QMD_MCP_TOKEN?.trim() || undefined;
-  const listenHost = process.env.QMD_MCP_HOST || "127.0.0.1";
+  // Fork default stays 127.0.0.1 (xworkmate-bridge dials 127.0.0.1; "localhost"
+  // may resolve to ::1 only). Upstream default was "localhost".
+  const listenHost = options.host ?? process.env.QMD_MCP_HOST ?? process.env.QMD_HOST ?? "127.0.0.1";
   const loopback = listenHost === "127.0.0.1" || listenHost === "::1" || listenHost === "localhost";
   if (!loopback && !mcpToken) {
-    throw new Error(`QMD_MCP_HOST=${listenHost} is not loopback: set QMD_MCP_TOKEN to protect /mcp and /query`);
+    throw new Error(`MCP host ${listenHost} is not loopback: set QMD_MCP_TOKEN to protect /mcp and /query`);
   }
   const mcpAuthorized = (req: IncomingMessage): boolean =>
     !mcpToken || bearerMatches(req.headers.authorization, mcpToken);
-
   const configPath = getConfigPath();
   const store = await createStore({
     dbPath: options.dbPath ?? getDefaultDbPath(),
@@ -1255,7 +1288,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
   // Pre-fetch default collection names for REST endpoint
   const defaultCollectionNames = await store.getDefaultCollectionNames();
 
-  // Shared memory bridge (PG backend) — one pool for all sessions.
+  // Shared memory bridge (PG backend) — one pool for all requests.
   const memory = await maybeOpenMemoryBridge();
 
   // Shared coordination layer. This is the topology the four-client setup wants:
@@ -1269,30 +1302,14 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
   const context = await maybeOpenContextBridge();
   const ingestToken = process.env.QMD_INGEST_TOKEN?.trim() || undefined;
 
-  // Session map: each client gets its own McpServer + Transport pair (MCP spec requirement).
-  // The store is shared — it's stateless SQLite, safe for concurrent access.
-  const sessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
-
-  async function createSession(): Promise<WebStandardStreamableHTTPServerTransport> {
-    const transport = new WebStandardStreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-      enableJsonResponse: true,
-      onsessioninitialized: (sessionId: string) => {
-        sessions.set(sessionId, transport);
-        log(`${ts()} New session ${sessionId} (${sessions.size} active)`);
-      },
-    });
-    const server = await createMcpServer(store, memory, task, context);
-    await server.connect(transport);
-
-    transport.onclose = () => {
-      if (transport.sessionId) {
-        sessions.delete(transport.sessionId);
-      }
-    };
-
-    return transport;
-  }
+  // Official 2026-07-28 HTTP entry: one factory, per-request instance, JSON
+  // responses (matches the previous enableJsonResponse: true). Dual-speaks
+  // 2025-era traffic statelessly by default (`legacy: "stateless"`).
+  // Fork: the per-request instances share the PG bridges opened above.
+  const mcpHandler = createMcpHandler(
+    () => createMcpServer(store, undefined, memory, task, context),
+    { responseMode: "json" },
+  );
 
   const startTime = Date.now();
   const quiet = options?.quiet ?? false;
@@ -1355,7 +1372,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
     return Buffer.concat(chunks).toString();
   }
 
-  const host = options.host ?? process.env.QMD_HOST ?? "localhost";
+  const host = listenHost;
   const originGuard = resolveOriginGuard({
     host,
     ...(options.allowedOrigins ? { allowedOrigins: options.allowedOrigins } : {}),
@@ -1397,13 +1414,13 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         return;
       }
 
-      if (pathname === INGEST_PATH || pathname.startsWith(`${INGEST_PATH}?`)) {
+      if (pathname === INGEST_PATH || pathname?.startsWith(`${INGEST_PATH}?`)) {
         await handleAgentIngest(nodeReq, nodeRes, context, ingestToken);
         log(`${ts()} ${nodeReq.method} ${INGEST_PATH} ${nodeRes.statusCode} (${Date.now() - reqStart}ms)`);
         return;
       }
 
-      const routePath = pathname.split("?")[0]!;
+      const routePath = (pathname ?? "/").split("?")[0]!;
       if (isAgentReadPath(routePath)) {
         await handleAgentRead(nodeReq, nodeRes, context, ingestToken);
         log(`${ts()} ${nodeReq.method} ${routePath} ${nodeRes.statusCode} (${Date.now() - reqStart}ms)`);
@@ -1517,7 +1534,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
   await new Promise<void>((resolve, reject) => {
     httpServer.on("error", reject);
-    httpServer.listen(port, listenHost, () => resolve());
+    httpServer.listen(port, host, () => resolve());
   });
 
   const actualPort = (httpServer.address() as import("net").AddressInfo).port;

@@ -45,7 +45,6 @@ import type {
 // Configuration
 // =============================================================================
 
-const HOME = process.env.HOME || process.env.USERPROFILE || "/tmp";
 export const DEFAULT_EMBED_MODEL = DEFAULT_EMBED_MODEL_URI;
 export const DEFAULT_RERANK_MODEL = DEFAULT_RERANK_MODEL_URI;
 export const DEFAULT_QUERY_MODEL = DEFAULT_GENERATE_MODEL_URI;
@@ -3251,7 +3250,12 @@ export async function chunkDocumentByTokens(
 
     const tokenCount = await countTokens(text);
     if (tokenCount <= maxTokens || text.length <= 1) {
-      results.push({ text, pos, tokens: tokenCount });
+      // Safety net: text.length <= 1 can only legitimately be a single
+      // BMP character (a well-formed astral character needs 2 code units),
+      // so this only ever strips something for already-malformed input.
+      const safeText = stripUnpairedSurrogates(text);
+      if (safeText.length === 0) return;
+      results.push({ text: safeText, pos, tokens: tokenCount });
       return;
     }
 
@@ -3286,9 +3290,14 @@ export async function chunkDocumentByTokens(
       || subChunks[0]?.text.length === text.length
     ) {
       const tokenLimit = Math.max(1, maxTokens);
-      const truncatedText = useLocalTokenizer
+      // Safety net: detokenize() reconstructs text from raw token IDs, and
+      // a tokenizer can encode a single astral-plane character across
+      // multiple tokens — truncating the token list can land mid-character.
+      // External-embedding mode (fork) truncates by approximate char width.
+      const truncatedText = stripUnpairedSurrogates(useLocalTokenizer
         ? await llm.detokenize((await llm.tokenize(text)).slice(0, tokenLimit))
-        : truncateByApproxTokens(text, tokenLimit);
+        : truncateByApproxTokens(text, tokenLimit));
+      if (truncatedText.length === 0) return;
       results.push({
         text: truncatedText,
         pos,

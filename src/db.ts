@@ -128,7 +128,6 @@ export function openDatabase(path: string): Database {
 export interface Database {
   exec(sql: string): void;
   prepare(sql: string): Statement;
-  transaction<T extends (...args: any[]) => any>(fn: T): T;
   loadExtension(path: string): void;
   // Both drivers return the wrapped function with variant methods attached
   // (better-sqlite3 and bun:sqlite each expose .immediate/.deferred/.exclusive).

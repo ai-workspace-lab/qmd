@@ -1294,7 +1294,10 @@ const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-re
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 ```
 
-YAML configuration can override those defaults; see `example-index.yml` for a complete config file:
+Override them per-role without touching source via the `models:` block in
+`index.yml` (see [Configuring `index.yml`](#configuring-indexyml)) or the
+`QMD_EMBED_MODEL` env var. Re-run `qmd embed` after changing the embedding model.
+In this fork the embedding default is the external NVIDIA API (see "Models" above):
 
 ```yaml
 models:

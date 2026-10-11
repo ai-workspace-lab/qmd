@@ -59,10 +59,13 @@ describe.skipIf(!!process.env.CI)("HTTP MCP remote-mode auth", () => {
     expect((await initialize({ Authorization: "Bearer wrong" })).status).toBe(401);
   });
 
-  test("/mcp with the bearer initializes a session", async () => {
+  test("/mcp with the bearer initializes (stateless, MCP 2026-07-28)", async () => {
+    // Rebased onto QMD 2.8.3: HTTP is sessionless, so there is no
+    // Mcp-Session-Id any more — a successful initialize result is the signal.
     const res = await initialize({ Authorization: `Bearer ${TOKEN}` });
     expect(res.status).toBe(200);
-    expect(res.headers.get("mcp-session-id")).toBeTruthy();
+    const body = await res.text();
+    expect(body).toContain('"serverInfo"');
   });
 
   test("/query without the bearer is 401; /health stays open", async () => {

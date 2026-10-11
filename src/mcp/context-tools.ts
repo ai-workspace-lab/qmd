@@ -8,7 +8,7 @@
  */
 
 import { existsSync } from "node:fs";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import {
   ITEM_KINDS,
@@ -121,7 +121,7 @@ export function registerContextTools(server: McpServer, ctx: ContextBridge, fall
         "verification results, touched paths, and git drift against your checkout. Set lead=true when you " +
         "intend to change direction (goal, next action, plan order); otherwise you contribute as a peer.",
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-      inputSchema: {
+      inputSchema: z.object({
         cwd: z.string().optional().describe("Absolute path of your checkout (strongly recommended)"),
         thread_id: z.string().optional().describe("Resume a specific thread instead of resolving from cwd"),
         pr: z.number().optional().describe("PR number, when known"),
@@ -132,7 +132,7 @@ export function registerContextTools(server: McpServer, ctx: ContextBridge, fall
         takeover: z.boolean().optional().describe("With lead: take over a handed-off or paused thread"),
         client: z.string().optional().describe("Your client name, e.g. claude-code, codex, antigravity"),
         session_id: z.string().optional().describe("Your client's own session id, for stable attribution"),
-      },
+      }),
     },
     async ({ cwd, thread_id, pr, scope, branch, head_sha, lead, takeover, client, session_id }, extra) => {
       const found = await threadFor({ thread_id, cwd, scope, pr, branch, head_sha });
@@ -173,7 +173,7 @@ export function registerContextTools(server: McpServer, ctx: ContextBridge, fall
         "paths. Never include file contents, diffs, logs, secrets or absolute paths — they are rejected. " +
         "goal/next_action from a non-driver are stored as proposals.",
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-      inputSchema: {
+      inputSchema: z.object({
         session_id: z.string().describe("session_id returned by task_resume"),
         thread_id: z.string().optional().describe("Thread from task_resume; omit to resolve from cwd"),
         cwd: z.string().optional().describe("Absolute path of your checkout"),
@@ -182,7 +182,7 @@ export function registerContextTools(server: McpServer, ctx: ContextBridge, fall
         head_sha: z.string().optional().describe("Current HEAD sha (remote mode)"),
         fence: z.number().optional().describe("Fence from task_resume when you are the driver"),
         items: z.array(itemSchema).min(1).max(50),
-      },
+      }),
     },
     async ({ session_id, thread_id, cwd, scope, branch, head_sha, fence, items }) => {
       const found = await threadFor({ thread_id, cwd, scope, branch, head_sha });
@@ -208,7 +208,7 @@ export function registerContextTools(server: McpServer, ctx: ContextBridge, fall
         "and any final items, releases the driver lease and marks the thread handed off so the next client's " +
         "task_resume starts exactly where you left off.",
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-      inputSchema: {
+      inputSchema: z.object({
         thread_id: z.string(),
         session_id: z.string(),
         fence: z.number(),
@@ -216,7 +216,7 @@ export function registerContextTools(server: McpServer, ctx: ContextBridge, fall
         cwd: z.string().optional(),
         head_sha: z.string().optional().describe("Current HEAD sha (remote mode)"),
         items: z.array(itemSchema).max(50).optional(),
-      },
+      }),
     },
     async ({ thread_id, session_id, fence, next_action, cwd, head_sha, items }) => {
       const res = await store.handoff(thread_id, session_id, fence, next_action, toItems(items, cwd, head_sha));
@@ -240,9 +240,9 @@ export function registerContextTools(server: McpServer, ctx: ContextBridge, fall
         "4. Recent active task threads. " +
         "Use this tool to discover tasks or projects to resume, or to check which agent is working on what.",
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-      inputSchema: {
+      inputSchema: z.object({
         cwd: z.string().optional().describe("Current working directory to filter or highlight relative tasks"),
-      },
+      }),
     },
     async ({ cwd }) => {
       const catalog = await store.getCatalog(cwd ? { scope: resolveScope(undefined, process.env, cwd) } : {});
