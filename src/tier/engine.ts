@@ -635,7 +635,12 @@ export class TierEngine {
     }
     const l1Items = await this.loadItems(l1Hits.map((h) => h.itemId));
     l1Hits = l1Hits.filter((h) => passes(l1Items.get(h.itemId)));
+    // L1-only answers are opt-in (fast:true / MEM_L1_SHORT_CIRCUIT=1): measured on
+    // the migrated sessions, QMD's unreranked L1 scores clear the threshold for
+    // almost any query, which hid relevant older (L2-only) items.
+    const fast = opts.fast ?? process.env.MEM_L1_SHORT_CIRCUIT === "1";
     const shortCircuit =
+      fast &&
       l1Hits.length >= Math.min(this.policy.l1MinHits, limit) &&
       (l1Hits[0]?.score ?? 0) >= this.policy.l1ShortCircuitScore;
 

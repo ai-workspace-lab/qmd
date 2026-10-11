@@ -50,7 +50,7 @@ export function tierHelp(): string {
 
 Search & read
   search <query>            Tiered search L1 → L2 (+facts); logs heat, promotes L2 hits to L1
-                            [-n 10] [--scope s] [--kind k] [--since 7d|date] [--agent a] [--json]
+                            [-n 10] [--scope s] [--kind k] [--since 7d|date] [--agent a] [--fast] [--json]
   recall <item_id|query>    Full content; summary-only items rehydrate from l3-cache or queue a fetch
   context <task>            Injectable context (facts + recent summaries + top snippets) [--budget 2000]
   timeline                  Items/summaries/facts in a window [--since 7d] [--until date] [--scope s]
@@ -157,6 +157,7 @@ export async function runTierCommand(args: string[], values: Values): Promise<nu
           kind: str(values.kind),
           since: parseSince(str(values.since)),
           agent,
+          ...(values.fast ? { fast: true } : {}),
         });
         out(json, r, () => {
           if (!r.hits.length) console.log(`${C.dim}no results${C.reset}`);

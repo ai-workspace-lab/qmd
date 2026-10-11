@@ -3121,6 +3121,7 @@ function parseCLI() {
       max: { type: "string" },        // embed max items
       delay: { type: "string" },      // embed delay between batches (ms)
       generate: { type: "boolean" },  // summary --generate
+      fast: { type: "boolean" },      // tier search: allow L1-only answers
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through

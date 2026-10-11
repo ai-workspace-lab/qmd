@@ -205,7 +205,7 @@ export class QmdL1Index implements L1Index {
       const itemId = itemIdFromL1Path(r.file);
       if (!itemId || seen.has(itemId)) continue;
       seen.add(itemId);
-      hits.push({ file: r.file, itemId, score: r.score, snippet: (r.bestChunk || r.body || "").slice(0, 400) });
+      hits.push({ file: r.file, itemId, score: r.score, snippet: l1Snippet(r.bestChunk || r.body || "") });
       if (hits.length >= limit) break;
     }
     return hits;
@@ -230,4 +230,16 @@ export class QmdL1Index implements L1Index {
       this.storePromise = undefined;
     }
   }
+}
+
+/** Drop the L1 file's frontmatter (whole or a chunk-cut tail of it) and a leading title. */
+export function l1Snippet(text: string): string {
+  let t = text;
+  const fm = /^\s*---\n[\s\S]*?\n---\n?/.exec(t);
+  if (fm) t = t.slice(fm[0].length);
+  else {
+    const end = t.indexOf("\n---\n");
+    if (end >= 0 && /\b(?:item_id|sha256|tier_reason):/.test(t.slice(0, end))) t = t.slice(end + 5);
+  }
+  return t.replace(/^\s*#\s+.*\n/, "").trim().slice(0, 400);
 }

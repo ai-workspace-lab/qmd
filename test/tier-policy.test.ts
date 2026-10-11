@@ -165,3 +165,12 @@ describe("helpers", () => {
     expect(r("key ghp_" + "a".repeat(36)).residual).toEqual(["github-token"]);
   });
 });
+
+import { l1Snippet } from "../src/tier/l1.js";
+describe("l1Snippet", () => {
+  test("strips full and chunk-cut frontmatter plus the title", () => {
+    expect(l1Snippet("---\nitem_id: x\nkind: note\n---\n# Title\n\nBody text")).toBe("Body text");
+    expect(l1Snippet("sha256: abc\ntier_reason: recent\n---\n# T\nRest")).toBe("Rest");
+    expect(l1Snippet("plain --- text\n---\nmore")).toBe("plain --- text\n---\nmore");
+  });
+});

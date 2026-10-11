@@ -106,6 +106,8 @@ export interface MemSearchOptions {
   agent?: string;
   /** Skip promotion side effects (benchmarks / read-only callers). */
   noPromote?: boolean;
+  /** Allow answering from L1 alone when it is confident (skips L2). Default off. */
+  fast?: boolean;
   /** Exclude restricted items (used by mem_context and posting). */
   excludeRestricted?: boolean;
 }
