@@ -86,7 +86,7 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive, defaultVectorMinScore } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -133,6 +133,7 @@ import {
   type SensitiveSnapshot,
 } from "../trust.js";
 import { runMemoryCommand, runPgCommand, runTaskCommand, runCtxCommand } from "./pg-commands.js";
+import { runTierCommand } from "./tier-commands.js";
 
 // NOTE: enableProductionMode() is intentionally NOT called at module scope here.
 // Importing this module for its exports (e.g. buildEditorUri, termLink from
@@ -2856,7 +2857,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
     let results = await vectorSearchQuery(store, query, {
       collection: collectionSearchFilter(collectionNames),
       limit: opts.all ? 500 : (opts.limit || 10),
-      minScore: opts.minScore || 0.3,
+      minScore: opts.minScore,
       intent: opts.intent,
       hooks: {
         onExpand: (original, expanded) => {
@@ -3105,6 +3106,22 @@ function parseCLI() {
       next: { type: "string" },       // next action for a handoff
       key: { type: "string" },        // item key (plan stepKey / decision memoryKey)
       detail: { type: "string" },     // path action or question resolution
+      // Tiered memory (qmd tier) options
+      kind: { type: "string" },       // mem item kind
+      reason: { type: "string" },     // forget reason
+      evidence: { type: "string" },   // comma-separated mem_item ids
+      date: { type: "string" },       // YYYY-MM-DD
+      until: { type: "string" },      // timeline end
+      entity: { type: "string" },     // fact subject
+      predicate: { type: "string" },  // fact predicate
+      object: { type: "string" },     // fact object
+      type: { type: "string" },       // entity type
+      budget: { type: "string" },     // context token budget
+      batch: { type: "string" },      // embed batch size
+      max: { type: "string" },        // embed max items
+      delay: { type: "string" },      // embed delay between batches (ms)
+      generate: { type: "boolean" },  // summary --generate
+      fast: { type: "boolean" },      // tier search: allow L1-only answers
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -3161,7 +3178,7 @@ function parseCLI() {
     format,
     full: !!values.full,
     limit: isAll ? 100000 : (values.n ? parseInt(String(values.n), 10) || defaultLimit : defaultLimit),
-    minScore: values["min-score"] ? parseFloat(String(values["min-score"])) || 0 : 0,
+    minScore: values["min-score"] !== undefined ? parseFloat(String(values["min-score"])) || 0 : 0,
     all: isAll,
     collection: values.collection as string[] | undefined,
     lineNumbers: !!values["line-numbers"],
@@ -3611,6 +3628,7 @@ function showHelp(): void {
   console.log("  qmd pg status                 - Show PostgreSQL memory backend health");
   console.log("  qmd task claim/who/release    - Multi-agent coordination (needs QMD_BACKEND=pg)");
   console.log("  qmd ctx collect/threads/brief - Shared task context across agent clients (needs QMD_BACKEND=pg)");
+  console.log("  qmd tier search/recall/remember/context/facts/status - Three-tier memory L1/L2/L3 (needs QMD_BACKEND=pg; see qmd tier help)");
   console.log("  qmd sync [--dry-run]          - Secure two-way sync with a remote QMD host");
   console.log("  qmd bench <fixture.json>      - Run search quality benchmarks against a fixture file");
   console.log("");
@@ -4802,9 +4820,11 @@ if (isMain) {
         console.error("Usage: qmd vsearch [options] <query>");
         process.exit(1);
       }
-      // Default min-score for vector search is 0.3
-      if (!cli.values["min-score"]) {
-        cli.opts.minScore = 0.3;
+      // Default min-score depends on the embed model (0.3 for local
+      // embeddinggemma, lower for external models whose cosine scores run
+      // lower). An explicit --min-score (including 0) is always honored.
+      if (cli.values["min-score"] === undefined) {
+        cli.opts.minScore = defaultVectorMinScore(resolveModelsForCli().embed);
       }
       await resolveLocalConfigTrust();
       await vectorSearch(cli.query, cli.opts);
@@ -5072,6 +5092,11 @@ if (isMain) {
 
     case "ctx": {
       const code = await runCtxCommand(cli.args, cli.values);
+      process.exit(code);
+    }
+
+    case "tier": {
+      const code = await runTierCommand(cli.args, cli.values);
       process.exit(code);
     }
 
