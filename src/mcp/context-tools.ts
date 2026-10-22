@@ -20,6 +20,7 @@ import {
   type IncomingItem,
 } from "../pg/index.js";
 import { renderBriefing } from "../pg/context-brief.js";
+import { LazyBridge, unavailableResult } from "./lazy-bridge.js";
 
 const itemSchema = z.object({
   kind: z.enum(ITEM_KINDS),
@@ -34,8 +35,22 @@ const itemSchema = z.object({
 
 type ItemArg = z.infer<typeof itemSchema>;
 
-export function registerContextTools(server: McpServer, ctx: ContextBridge, fallbackScope: string): void {
-  const store = ctx.store;
+export function registerContextTools(
+  server: McpServer,
+  bridge: LazyBridge<ContextBridge>,
+  fallbackScope: string,
+): void {
+  // Resolved per call: PostgreSQL may come up after this server started.
+  let store!: ContextBridge["store"];
+  const guard = <A extends unknown[], R>(handler: (...args: A) => Promise<R>) =>
+    async (...args: A): Promise<R | ReturnType<typeof unavailableResult>> => {
+      try {
+        store = (await bridge.get()).store;
+      } catch (err) {
+        return unavailableResult(err);
+      }
+      return handler(...args);
+    };
 
   /** Client identity: explicit arg, else the MCP client's own name. */
   const sourceOf = (client?: string): string => {
@@ -134,7 +149,7 @@ export function registerContextTools(server: McpServer, ctx: ContextBridge, fall
         session_id: z.string().optional().describe("Your client's own session id, for stable attribution"),
       }),
     },
-    async ({ cwd, thread_id, pr, scope, branch, head_sha, lead, takeover, client, session_id }, extra) => {
+    guard(async ({ cwd, thread_id, pr, scope, branch, head_sha, lead, takeover, client, session_id }, extra) => {
       const found = await threadFor({ thread_id, cwd, scope, pr, branch, head_sha });
       if ("error" in found) return { content: [{ type: "text", text: found.error }], isError: true };
       const head = head_sha?.trim() || (cwd && existsSync(cwd) ? resolveBaseSha(cwd) : undefined);
@@ -160,7 +175,7 @@ export function registerContextTools(server: McpServer, ctx: ContextBridge, fall
         content: [{ type: "text", text }],
         structuredContent: { threadId: found.thread.id, sessionId, fence, created: found.created, briefing },
       };
-    },
+    }),
   );
 
   server.registerTool(
@@ -184,7 +199,7 @@ export function registerContextTools(server: McpServer, ctx: ContextBridge, fall
         items: z.array(itemSchema).min(1).max(50),
       }),
     },
-    async ({ session_id, thread_id, cwd, scope, branch, head_sha, fence, items }) => {
+    guard(async ({ session_id, thread_id, cwd, scope, branch, head_sha, fence, items }) => {
       const found = await threadFor({ thread_id, cwd, scope, branch, head_sha });
       if ("error" in found) return { content: [{ type: "text", text: found.error }], isError: true };
       const result = await store.mergeItems(found.thread.id, session_id, toItems(items, cwd, head_sha), {
@@ -196,7 +211,7 @@ export function registerContextTools(server: McpServer, ctx: ContextBridge, fall
         (result.proposed ? `, ${result.proposed} stored as proposals (you are not the driver)` : "") +
         (result.rejected.length ? `\nRejected: ${result.rejected.map((r) => `${r.kind}: ${r.reason}`).join("; ")}` : "");
       return { content: [{ type: "text", text }], structuredContent: { result } };
-    },
+    }),
   );
 
   server.registerTool(
@@ -218,14 +233,14 @@ export function registerContextTools(server: McpServer, ctx: ContextBridge, fall
         items: z.array(itemSchema).max(50).optional(),
       }),
     },
-    async ({ thread_id, session_id, fence, next_action, cwd, head_sha, items }) => {
+    guard(async ({ thread_id, session_id, fence, next_action, cwd, head_sha, items }) => {
       const res = await store.handoff(thread_id, session_id, fence, next_action, toItems(items, cwd, head_sha));
       if (!res.ok) return { content: [{ type: "text", text: `Handoff refused: ${res.reason}` }], isError: true };
       return {
         content: [{ type: "text", text: `Handed off. Next: ${next_action}` }],
         structuredContent: { result: res.merge },
       };
-    },
+    }),
   );
 
   server.registerTool(
@@ -244,7 +259,7 @@ export function registerContextTools(server: McpServer, ctx: ContextBridge, fall
         cwd: z.string().optional().describe("Current working directory to filter or highlight relative tasks"),
       }),
     },
-    async ({ cwd }) => {
+    guard(async ({ cwd }) => {
       const catalog = await store.getCatalog(cwd ? { scope: resolveScope(undefined, process.env, cwd) } : {});
 
       let text = `# Shared Task & Project Catalog\n\n`;
@@ -286,7 +301,7 @@ export function registerContextTools(server: McpServer, ctx: ContextBridge, fall
         content: [{ type: "text", text }],
         structuredContent: catalog,
       };
-    },
+    }),
   );
 }
 
