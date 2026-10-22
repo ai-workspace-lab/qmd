@@ -45,6 +45,7 @@ import {
 import { registerContextTools } from "./context-tools.js";
 import { registerMemTools } from "./mem-tools.js";
 import { openTierEngine, type TierEngine } from "../tier/index.js";
+import { LazyBridge, unavailableResult } from "./lazy-bridge.js";
 import { handleAgentIngest, INGEST_PATH } from "./agent-ingest.js";
 import { handleAgentRead, isAgentReadPath, bearerMatches } from "./agent-read.js";
 
@@ -189,8 +190,8 @@ async function createMcpServer(
   store: QMDStore,
   inflight?: InflightGate,
   memory?: MemoryBridge,
-  task?: TaskBridge,
-  context?: ContextBridge,
+  task?: LazyBridge<TaskBridge>,
+  context?: LazyBridge<ContextBridge>,
   tier?: TierEngine,
 ): Promise<McpServer> {
   // Wraps request handlers so a stdio EOF shutdown can wait for in-flight
@@ -618,7 +619,7 @@ Intent-aware lex (C++ performance, not sports):
     registerTaskTools(server, task);
   }
   if (context) {
-    registerContextTools(server, context, task?.scope ?? resolveScope());
+    registerContextTools(server, context, task?.current?.scope ?? resolveScope());
   }
   if (tier) {
     registerMemTools(server, tier);
@@ -754,7 +755,18 @@ function registerMemoryTools(server: McpServer, memory: MemoryBridge): void {
  * checkout), and only fall back to the bridge default for the stdio case where
  * server and caller do share a directory.
  */
-function registerTaskTools(server: McpServer, task: TaskBridge): void {
+function registerTaskTools(server: McpServer, bridge: LazyBridge<TaskBridge>): void {
+  // Resolved per call: the bridge may come up after this server started.
+  let task!: TaskBridge;
+  const guard = <A extends unknown[], R>(handler: (...args: A) => Promise<R>) =>
+    async (...args: A): Promise<R | ReturnType<typeof unavailableResult>> => {
+      try {
+        task = await bridge.get();
+      } catch (err) {
+        return unavailableResult(err);
+      }
+      return handler(...args);
+    };
   // In remote mode the caller's cwd does not exist on this host; refuse to guess
   // a scope from a missing path (it would silently file claims under a basename).
   const scopeOf = (scope?: string, cwd?: string): string => {
@@ -789,7 +801,7 @@ function registerTaskTools(server: McpServer, task: TaskBridge): void {
         force: z.boolean().optional().describe("Take over a live claim held by another agent"),
       }),
     },
-    async ({ resource, intent, scope, cwd, ttl_seconds, force }) => {
+    guard(async ({ resource, intent, scope, cwd, ttl_seconds, force }) => {
       const s = scopeOf(scope, cwd);
       const res = await task.store.claim({
         scope: s,
@@ -809,7 +821,7 @@ function registerTaskTools(server: McpServer, task: TaskBridge): void {
           (res.holder.branch ? ` on branch ${res.holder.branch}` : "") +
           `. Coordinate with them or choose other work.`;
       return { content: [{ type: "text", text }], structuredContent: { result: res } };
-    },
+    }),
   );
 
   server.registerTool(
@@ -826,7 +838,7 @@ function registerTaskTools(server: McpServer, task: TaskBridge): void {
         cwd: z.string().optional().describe("Checkout directory the resource lives in"),
       }),
     },
-    async ({ resource, scope, cwd }) => {
+    guard(async ({ resource, scope, cwd }) => {
       const holders = await task.store.who(scopeOf(scope, cwd), resource);
       const others = holders.filter((h) => h.agentId !== task.agentId);
       const text =
@@ -842,7 +854,7 @@ function registerTaskTools(server: McpServer, task: TaskBridge): void {
                 )
                 .join("\n");
       return { content: [{ type: "text", text }], structuredContent: { holders } };
-    },
+    }),
   );
 
   server.registerTool(
@@ -863,7 +875,7 @@ function registerTaskTools(server: McpServer, task: TaskBridge): void {
         force: z.boolean().optional().describe("Release a claim held by another agent"),
       }),
     },
-    async ({ resource, status, note, scope, cwd, force }) => {
+    guard(async ({ resource, status, note, scope, cwd, force }) => {
       const released = await task.store.release(scopeOf(scope, cwd), resource, {
         agentId: task.agentId,
         status: status ?? "done",
@@ -887,7 +899,7 @@ function registerTaskTools(server: McpServer, task: TaskBridge): void {
         content: [{ type: "text", text }],
         structuredContent: { released, drift: drift ?? null },
       };
-    },
+    }),
   );
 
   server.registerTool(
@@ -905,7 +917,7 @@ function registerTaskTools(server: McpServer, task: TaskBridge): void {
         include_stale: z.boolean().optional().describe("Also show TTL-lapsed claims"),
       }),
     },
-    async ({ scope, cwd, include_stale }) => {
+    guard(async ({ scope, cwd, include_stale }) => {
       const s = scopeOf(scope, cwd);
       const claims = await task.store.list(s, { includeStale: !!include_stale });
       const text =
@@ -921,7 +933,7 @@ function registerTaskTools(server: McpServer, task: TaskBridge): void {
               )
               .join("\n");
       return { content: [{ type: "text", text }], structuredContent: { scope: s, claims } };
-    },
+    }),
   );
 
   server.registerTool(
@@ -938,13 +950,13 @@ function registerTaskTools(server: McpServer, task: TaskBridge): void {
         cwd: z.string().optional().describe("Checkout directory the resource lives in"),
       }),
     },
-    async ({ resource, scope, cwd }) => {
+    guard(async ({ resource, scope, cwd }) => {
       const ok = await task.store.heartbeat(scopeOf(scope, cwd), resource, task.agentId);
       return {
         content: [{ type: "text", text: ok ? `Extended ${resource}.` : `No live claim of yours on ${resource}.` }],
         structuredContent: { ok },
       };
-    },
+    }),
   );
 }
 
@@ -1176,8 +1188,8 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
   // ai-workspace-lab fork: PG-backed memory / task coordination / shared
   // context bridges (QMD_BACKEND=pg). One pool shared by every MCP instance.
   const memory = await maybeOpenMemoryBridge();
-  const task = await maybeOpenTaskBridge();
-  const context = await maybeOpenContextBridge();
+  const task = lazyTaskBridge();
+  const context = lazyContextBridge();
   const tier = await maybeOpenTierEngine(store);
   const inflight = createInflightGate();
   // serveStdio dual-speaks 2026-07-28 and 2025-era clients on one connection
@@ -1208,27 +1220,17 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
  * the SQLite-only experience is unchanged. Failures are logged (not fatal) so a
  * misconfigured PG never takes down local document search.
  */
-async function maybeOpenTaskBridge(): Promise<TaskBridge | undefined> {
-  if (!isPgBackend()) return undefined;
-  try {
-    return await openTaskBridge();
-  } catch (err) {
-    // Fail open. Coordination is advisory: an unreachable PG must degrade to
-    // "no coordination", never to "no agent".
-    console.error(`[qmd:mcp] task coordination disabled: ${(err as Error).message}`);
-    return undefined;
-  }
+/**
+ * Task coordination and shared context connect lazily. Coordination is advisory
+ * and fail-open: an unreachable PG makes the tools return an explicit error
+ * instead of disappearing, and they recover by themselves once PG is back.
+ */
+function lazyTaskBridge(): LazyBridge<TaskBridge> | undefined {
+  return isPgBackend() ? new LazyBridge("task coordination (PostgreSQL)", () => openTaskBridge()) : undefined;
 }
 
-async function maybeOpenContextBridge(): Promise<ContextBridge | undefined> {
-  if (!isPgBackend()) return undefined;
-  try {
-    return await openContextBridge();
-  } catch (err) {
-    // Same fail-open stance as coordination: no shared context, still an agent.
-    console.error(`[qmd:mcp] shared task context disabled: ${(err as Error).message}`);
-    return undefined;
-  }
+function lazyContextBridge(): LazyBridge<ContextBridge> | undefined {
+  return isPgBackend() ? new LazyBridge("shared task context (PostgreSQL)", () => openContextBridge()) : undefined;
 }
 
 /**
@@ -1317,11 +1319,14 @@ export async function startMcpHttpServer(
   // one `qmd mcp --http --daemon` process, one connection pool, and therefore one
   // consistent view of who holds what across Claude Code / OpenCode / Codex /
   // Antigravity. See docs/plan/agent-task-coordination.md §8.1.
-  const task = await maybeOpenTaskBridge();
+  const task = lazyTaskBridge();
 
   // Shared task context: MCP task_resume/task_note/task_handoff plus the one-way
   // ingest endpoint that xworkmate-bridge forwards web/mobile contributions to.
-  const context = await maybeOpenContextBridge();
+  const context = lazyContextBridge();
+  // Warm both connections without blocking startup; failures retry on use.
+  void task?.tryGet();
+  void context?.tryGet();
   const ingestToken = process.env.QMD_INGEST_TOKEN?.trim() || undefined;
   const tier = await maybeOpenTierEngine(store);
 
@@ -1438,14 +1443,14 @@ export async function startMcpHttpServer(
       }
 
       if (pathname === INGEST_PATH || pathname?.startsWith(`${INGEST_PATH}?`)) {
-        await handleAgentIngest(nodeReq, nodeRes, context, ingestToken);
+        await handleAgentIngest(nodeReq, nodeRes, await context?.tryGet(), ingestToken);
         log(`${ts()} ${nodeReq.method} ${INGEST_PATH} ${nodeRes.statusCode} (${Date.now() - reqStart}ms)`);
         return;
       }
 
       const routePath = (pathname ?? "/").split("?")[0]!;
       if (isAgentReadPath(routePath)) {
-        await handleAgentRead(nodeReq, nodeRes, context, ingestToken);
+        await handleAgentRead(nodeReq, nodeRes, await context?.tryGet(), ingestToken);
         log(`${ts()} ${nodeReq.method} ${routePath} ${nodeRes.statusCode} (${Date.now() - reqStart}ms)`);
         return;
       }
@@ -1555,6 +1560,35 @@ export async function startMcpHttpServer(
     }
   });
 
+  // Periodic collection of local agent session directories into the shared
+  // context (pinned tasks, projects, session facts). Off unless
+  // QMD_CTX_COLLECT_INTERVAL (seconds, minimum 30) is set. Cursors make each
+  // pass incremental; an unreachable PG just skips the pass.
+  const collectEverySec = Number.parseInt(process.env.QMD_CTX_COLLECT_INTERVAL ?? "", 10);
+  let collectTimer: ReturnType<typeof setInterval> | undefined;
+  if (context && Number.isFinite(collectEverySec) && collectEverySec > 0) {
+    const intervalMs = Math.max(30, collectEverySec) * 1000;
+    let collecting = false;
+    const collectOnce = async () => {
+      if (collecting) return;
+      collecting = true;
+      try {
+        const bridge = await context.tryGet();
+        if (!bridge) return;
+        const { runCollect } = await import("../collect/index.js");
+        const report = await runCollect({ store: bridge.store, sinceMs: Date.now() - 7 * 86_400_000 });
+        log(`${ts()} ctx collect: files ${report.files}, sessions ${report.sessions}, errors ${report.errors.length}`);
+      } catch (err) {
+        console.error(`[qmd:mcp] ctx collect failed: ${(err as Error).message}`);
+      } finally {
+        collecting = false;
+      }
+    };
+    collectTimer = setInterval(() => void collectOnce(), intervalMs);
+    collectTimer.unref();
+    void collectOnce();
+  }
+
   await new Promise<void>((resolve, reject) => {
     httpServer.on("error", reject);
     httpServer.listen(port, host, () => resolve());
@@ -1570,6 +1604,7 @@ export async function startMcpHttpServer(
     httpServer.close();
     await store.close();
     if (memory) await memory.dispose();
+    if (collectTimer) clearInterval(collectTimer);
     if (task) await task.dispose();
     if (context) await context.dispose();
     if (tier) await tier.close();
