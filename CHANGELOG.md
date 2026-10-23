@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Add an opt-in Antigravity document archiver with hash manifests, credential-record quarantine, sink-before-checkpoint ordering and isolated failure fixtures (Bridge issue #35).
+
 ### Changes (ai-workspace-lab fork, rebased onto 2.8.3)
 
 - Context: **two-way sync for every client through xworkmate-bridge**.
