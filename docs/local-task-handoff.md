@@ -30,3 +30,10 @@ Archive final documents in the Knowledge repository. Store repository-relative
 document paths, PR/commit references, decisions and next actions in the task.
 Update the Knowledge collection and generate embeddings after archiving; task
 read/write, document indexing and vector retrieval are separate checks.
+
+Ollama can supply local embeddings without a placeholder key. Set the configured
+embedding model to `qwen3-embedding:0.6b` and set
+`QMD_EMBED_API_BASE_URL=http://127.0.0.1:11434/v1`. QMD omits Authorization when
+no key is set on a loopback embedding endpoint; remote endpoints still require
+credentials. Start Ollama, pull the model, then embed the archived Knowledge
+collection and verify it with pure vector search.
