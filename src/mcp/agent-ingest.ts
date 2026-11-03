@@ -77,15 +77,16 @@ export async function handleAgentIngest(
   res: ServerResponse,
   ctx: ContextBridge | undefined,
   token: string | undefined,
+  localNoAuth = false,
 ): Promise<void> {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
     return error(res, 405, "method_not_allowed", "ingest is write-only: POST");
   }
   // Fail closed: without a configured token the endpoint does not exist in practice.
-  if (!token) return error(res, 503, "ingest_disabled", "QMD_INGEST_TOKEN is not configured");
+  if (!localNoAuth && !token) return error(res, 503, "ingest_disabled", "QMD_INGEST_TOKEN is not configured");
   if (!ctx) return error(res, 503, "context_unavailable", "shared context store is not available");
-  if (!tokenMatches(req.headers.authorization, token)) return error(res, 401, "unauthorized", "invalid bearer token");
+  if (!localNoAuth && !tokenMatches(req.headers.authorization, token!)) return error(res, 401, "unauthorized", "invalid bearer token");
   if (!/^application\/json\b/i.test(req.headers["content-type"] ?? "")) {
     return error(res, 415, "unsupported_media_type", "Content-Type must be application/json");
   }

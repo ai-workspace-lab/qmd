@@ -1298,11 +1298,17 @@ export async function startMcpHttpServer(
   // may resolve to ::1 only). Upstream default was "localhost".
   const listenHost = options.host ?? process.env.QMD_MCP_HOST ?? process.env.QMD_HOST ?? "127.0.0.1";
   const loopback = listenHost === "127.0.0.1" || listenHost === "::1" || listenHost === "localhost";
+  // Explicit local desktop mode covers both MCP and the task read/write API.
+  // Never infer trust from forwarded headers or a container's published port.
+  const localNoAuth = process.env.QMD_LOCAL_NO_AUTH === "1";
+  if (localNoAuth && !loopback) {
+    throw new Error("QMD_LOCAL_NO_AUTH=1 requires a loopback listen host");
+  }
   if (!loopback && !mcpToken) {
     throw new Error(`MCP host ${listenHost} is not loopback: set QMD_MCP_TOKEN to protect /mcp and /query`);
   }
   const mcpAuthorized = (req: IncomingMessage): boolean =>
-    !mcpToken || bearerMatches(req.headers.authorization, mcpToken);
+    localNoAuth || !mcpToken || bearerMatches(req.headers.authorization, mcpToken);
   const configPath = getConfigPath();
   const store = await createStore({
     dbPath: options.dbPath ?? getDefaultDbPath(),
@@ -1443,14 +1449,14 @@ export async function startMcpHttpServer(
       }
 
       if (pathname === INGEST_PATH || pathname?.startsWith(`${INGEST_PATH}?`)) {
-        await handleAgentIngest(nodeReq, nodeRes, await context?.tryGet(), ingestToken);
+        await handleAgentIngest(nodeReq, nodeRes, await context?.tryGet(), ingestToken, localNoAuth);
         log(`${ts()} ${nodeReq.method} ${INGEST_PATH} ${nodeRes.statusCode} (${Date.now() - reqStart}ms)`);
         return;
       }
 
       const routePath = (pathname ?? "/").split("?")[0]!;
       if (isAgentReadPath(routePath)) {
-        await handleAgentRead(nodeReq, nodeRes, await context?.tryGet(), ingestToken);
+        await handleAgentRead(nodeReq, nodeRes, await context?.tryGet(), ingestToken, localNoAuth);
         log(`${ts()} ${nodeReq.method} ${routePath} ${nodeRes.statusCode} (${Date.now() - reqStart}ms)`);
         return;
       }
