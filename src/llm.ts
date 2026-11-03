@@ -1528,7 +1528,10 @@ export class LlamaCpp implements LLM {
 
   private async embedExternal(texts: string[], model: string, options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
     if (texts.length === 0) return [];
-    if (!this.embedApiKey) {
+    const endpoint = new URL(this.embedApiBaseUrl);
+    const localEndpoint = ["http:", "https:"].includes(endpoint.protocol) &&
+      ["localhost", "127.0.0.1", "[::1]"].includes(endpoint.hostname);
+    if (!this.embedApiKey && !localEndpoint) {
       throw new Error(
         "External embedding API key is required. Set NVIDIA_API_KEY, QMD_EMBED_API_KEY, or OPENAI_API_KEY. " +
         "For local embeddings, set QMD_EMBED_MODEL to an hf: or .gguf model URI."
@@ -1564,7 +1567,7 @@ export class LlamaCpp implements LLM {
         response = await fetch(`${this.embedApiBaseUrl}/embeddings`, {
           method: "POST",
           headers: {
-            "Authorization": `Bearer ${this.embedApiKey}`,
+            ...(this.embedApiKey ? { "Authorization": `Bearer ${this.embedApiKey}` } : {}),
             "Content-Type": "application/json",
           },
           body: requestBody,

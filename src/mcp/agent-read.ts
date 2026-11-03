@@ -54,13 +54,14 @@ export async function handleAgentRead(
   res: ServerResponse,
   ctx: ContextBridge | undefined,
   token: string | undefined,
+  localNoAuth = false,
 ): Promise<void> {
   if (req.method !== "GET") {
     res.setHeader("Allow", "GET");
     return error(res, 405, "method_not_allowed", "agent read routes accept GET only");
   }
-  if (!token) return error(res, 503, "endpoint_disabled", "QMD_INGEST_TOKEN is not configured");
-  if (!bearerMatches(req.headers.authorization, token)) {
+  if (!localNoAuth && !token) return error(res, 503, "endpoint_disabled", "QMD_INGEST_TOKEN is not configured");
+  if (!localNoAuth && !bearerMatches(req.headers.authorization, token!)) {
     return error(res, 401, "unauthorized", "missing or invalid bearer token");
   }
   if (!ctx) return error(res, 503, "context_unavailable", "shared context store is not available");

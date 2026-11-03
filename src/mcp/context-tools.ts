@@ -107,7 +107,8 @@ export function registerContextTools(
       return {
         error:
           `${branch ?? "this checkout"} is a default branch, so it does not identify a task. ` +
-          `Pass pr, or thread_id of an existing thread.`,
+          `Call task_catalog with this cwd or scope to discover existing tasks, then pass their thread_id. ` +
+          `Alternatively pass pr, or the task's branch together with scope.`,
       };
     }
     return { thread: resolved.thread, created: resolved.created };
@@ -257,10 +258,12 @@ export function registerContextTools(
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
       inputSchema: z.object({
         cwd: z.string().optional().describe("Current working directory to filter or highlight relative tasks"),
+        scope: z.string().optional().describe("Repository scope, e.g. github.com/org/repo; use when cwd differs between clients"),
       }),
     },
-    guard(async ({ cwd }) => {
-      const catalog = await store.getCatalog(cwd ? { scope: resolveScope(undefined, process.env, cwd) } : {});
+    guard(async ({ cwd, scope }) => {
+      const project = scope?.trim() || (cwd ? resolveScope(undefined, process.env, cwd) : undefined);
+      const catalog = await store.getCatalog(project ? { scope: project } : {});
 
       let text = `# Shared Task & Project Catalog\n\n`;
 
@@ -296,6 +299,16 @@ export function registerContextTools(
         }
         text += "\n";
       }
+
+      text += `## Recent task threads (${catalog.recentThreads.length})\n\n`;
+      if (!catalog.recentThreads.length) text += `No matching task threads.\n\n`;
+      for (const thread of catalog.recentThreads) {
+        const label = thread.title || thread.headBranch || (thread.prNumber ? `PR #${thread.prNumber}` : thread.id);
+        text += `- **${label}** [${thread.state}]\n` +
+          `  Scope: \`${thread.scope}\`; branch: \`${thread.headBranch ?? "none"}\`; PR: ${thread.prNumber ?? "none"}\n` +
+          `  Resume: task_resume({"thread_id":"${thread.id}"})\n`;
+      }
+      text += `\nAcross apps or worktrees, resume the same thread_id to share notes and handoffs.\n`;
 
       return {
         content: [{ type: "text", text }],
