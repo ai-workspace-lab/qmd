@@ -77,7 +77,7 @@ export async function openMemoryBridge(
     disposeModelsOnInactivity: true,
   });
 
-  const store = await PgMemoryStore.open(config, llm);
+  const store = await PgMemoryStore.open(config, llm, { model: llm.embedModelName });
 
   return {
     store,
