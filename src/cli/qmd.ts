@@ -134,6 +134,7 @@ import {
 } from "../trust.js";
 import { runMemoryCommand, runPgCommand, runTaskCommand, runCtxCommand } from "./pg-commands.js";
 import { runTierCommand } from "./tier-commands.js";
+import { runLoginCommand, runLogoutCommand, runWhoamiCommand, printLoginHelp } from "./login-commands.js";
 
 // NOTE: enableProductionMode() is intentionally NOT called at module scope here.
 // Importing this module for its exports (e.g. buildEditorUri, termLink from
@@ -3017,8 +3018,16 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
 
 // Parse CLI arguments using util.parseArgs
 function parseCLI() {
+  // `qmd login --status` is a boolean alias of `qmd login status`; strip it before
+  // parseArgs because `--status` is a string option for `qmd task release`.
+  let cliArgs = process.argv.slice(2);
+  let loginStatus = false;
+  if (cliArgs[0] === "login" && cliArgs.includes("--status")) {
+    loginStatus = true;
+    cliArgs = cliArgs.filter((a) => a !== "--status");
+  }
   const { values, positionals } = parseArgs({
-    args: process.argv.slice(2), // Skip node and script path
+    args: cliArgs, // Skip node and script path
     options: {
       // Global options
       index: {
@@ -3122,6 +3131,20 @@ function parseCLI() {
       delay: { type: "string" },      // embed delay between batches (ms)
       generate: { type: "boolean" },  // summary --generate
       fast: { type: "boolean" },      // tier search: allow L1-only answers
+      // Hub login (qmd login / logout / whoami)
+      hub: { type: "string" },              // Hub URL or host (default https://qmd.svc.plus)
+      "accounts-url": { type: "string" },   // accounts service override
+      identifier: { type: "string" },       // email or username
+      email: { type: "string" },            // alias for --identifier
+      username: { type: "string" },         // alias for --identifier
+      "password-stdin": { type: "boolean" },
+      code: { type: "string" },             // alias for --mfa-code
+      "mfa-code": { type: "string" },       // TOTP code, sent with the password in one call
+      totp: { type: "string" },             // alias for --mfa-code
+      "non-interactive": { type: "boolean" },
+      token: { type: "string" },            // non-interactive Hub token (prefer --token-stdin)
+      "token-stdin": { type: "boolean" },
+      "keep-session": { type: "boolean" },  // logout without revoking the accounts session
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -3195,7 +3218,7 @@ function parseCLI() {
     args: positionals.slice(1),
     query: positionals.slice(1).join(" "),
     opts,
-    values,
+    values: loginStatus ? { ...values, "login-status": true } : values,
   };
 }
 
@@ -3630,6 +3653,8 @@ function showHelp(): void {
   console.log("  qmd ctx collect/threads/brief - Shared task context across agent clients (needs QMD_BACKEND=pg)");
   console.log("  qmd tier search/recall/remember/context/facts/status - Three-tier memory L1/L2/L3 (needs QMD_BACKEND=pg; see qmd tier help)");
   console.log("  qmd sync [--dry-run]          - Secure two-way sync with a remote QMD host");
+  console.log("  qmd login [--hub <url>]       - Sign in to a QMD Hub (default qmd.svc.plus) with accounts.svc.plus");
+  console.log("  qmd whoami / qmd logout       - Show or clear the saved Hub login (per Hub domain)");
   console.log("  qmd bench <fixture.json>      - Run search quality benchmarks against a fixture file");
   console.log("");
   console.log("Collections & context:");
@@ -4386,6 +4411,11 @@ if (isMain) {
     process.exit(0);
   }
 
+  if (cli.values.help && (cli.command === "login" || cli.command === "logout" || cli.command === "whoami")) {
+    printLoginHelp();
+    process.exit(0);
+  }
+
   if (cli.values.help && cli.command === "sync") {
     console.log("Usage: qmd sync [options]");
     console.log("");
@@ -5098,6 +5128,18 @@ if (isMain) {
     case "tier": {
       const code = await runTierCommand(cli.args, cli.values);
       process.exit(code);
+    }
+
+    case "login": {
+      process.exit(await runLoginCommand(cli.args, cli.values));
+    }
+
+    case "logout": {
+      process.exit(await runLogoutCommand(cli.args, cli.values));
+    }
+
+    case "whoami": {
+      process.exit(await runWhoamiCommand(cli.args, cli.values));
     }
 
     default:

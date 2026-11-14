@@ -1083,6 +1083,65 @@ qmd multi-get "docs/*.md" --json
 qmd cleanup
 ```
 
+### Hub Login (`qmd login`)
+
+Sign the CLI in to a QMD Hub (Hub-Spoke / L4 enterprise mode) with the
+**accounts.svc.plus** unified account — the same account service used by
+`desktop.svc.plus`. The official Hub is `https://qmd.svc.plus`; any custom-domain
+Hub works the same way. Baseline: ai-workspace-services/knowledge#400
+(*QMD 单体运行与分布式异步同步架构规范*).
+
+```sh
+qmd login                                   # interactive: email/username, hidden password, TOTP if MFA is on
+qmd login --hub qmd.example.com             # custom-domain Hub (https; http only for localhost)
+qmd whoami                                  # or: qmd login status / qmd login --status
+qmd logout                                  # removes the profile and revokes the accounts session
+qmd logout --all
+```
+
+Non-interactive (CI / scripts) — give everything at once; one accounts call
+completes login + MFA and nothing is ever prompted:
+
+```sh
+# password on stdin (recommended), TOTP in the same command
+qmd login --email me@example.com --password-stdin --mfa-code 123456 < ~/.secrets/pw
+# or via environment
+QMD_EMAIL=me@example.com QMD_PASSWORD=... QMD_MFA_CODE=123456 qmd login
+# machine credential (Hub sync token or an existing accounts session token)
+qmd login --token-stdin < /etc/qmd/hub-token
+QMD_HUB_TOKEN=... qmd login
+```
+
+Exit codes: `0` ok, `1` authentication/network failure, `2` missing input,
+`3` the account needs MFA but no `--mfa-code` / `--totp` / `QMD_MFA_CODE` was given
+(non-interactive only — interactive mode prompts for it).
+
+How it works:
+
+- Sign-in uses the public accounts API only: `POST /api/auth/login`
+  (`identifier`, `password`, optional `totpCode` for one-shot MFA) and, when
+  accounts answers `mfaRequired`, `POST /api/auth/mfa/verify` with the ticket.
+- The session is then verified against the Hub (`GET /api/v1/auth/whoami`, falls
+  back to `GET /` on older Hubs); the Hub enforces its own role policy (the
+  official Hub admits `admin`). A session the Hub rejects is revoked, not saved.
+- A custom Hub advertises its account service in its `401` body
+  (`accounts_url`); override with `--accounts-url` / `QMD_ACCOUNTS_URL`.
+- Credentials are stored per Hub origin in `<config dir>/credentials.json`
+  (mode `0600`, override `QMD_CREDENTIALS_FILE`). Tokens and passwords are never
+  printed.
+- Hub selection: `--hub` > `QMD_HUB_URL` > `index.yml` `hub.url` > last login >
+  `https://qmd.svc.plus`. Tools that talk to the Hub resolve the Bearer token as
+  `QMD_HUB_TOKEN` > `QMD_HUB_TOKEN_FILE` > the `qmd login` profile.
+- `QMD_HUB_RESOLVE=host:443:IP` pins a Hub host to an address (curl `--resolve`
+  style) to test a Hub before its DNS record is live; TLS is still verified.
+
+```yaml
+# index.yml (optional)
+hub:
+  url: https://qmd.svc.plus
+  accounts_url: https://accounts.svc.plus
+```
+
 ### Benchmarking
 
 Measure search quality across all four backends with `qmd bench` and a fixture file
@@ -1175,6 +1234,12 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
 | `XDG_CONFIG_HOME` | `~/.config` | Config directory location (where `index.yml` lives) |
 | `QMD_CONFIG_DIR` | unset | Override the config directory outright (takes precedence over `XDG_CONFIG_HOME`) |
+| `QMD_HUB_URL` | `https://qmd.svc.plus` | Hub for `qmd login` / `qmd whoami` / `qmd logout` (custom domains allowed) |
+| `QMD_ACCOUNTS_URL` | Hub-advertised, else `https://accounts.svc.plus` | Unified account service for `qmd login` |
+| `QMD_CREDENTIALS_FILE` | `<config dir>/credentials.json` | Per-Hub login profiles (written 0600) |
+| `QMD_HUB_TOKEN` | unset | Non-interactive Hub token (sync token or accounts session) |
+| `QMD_EMAIL` / `QMD_PASSWORD` / `QMD_MFA_CODE` | unset | Non-interactive `qmd login` inputs (prefer `--password-stdin` over `QMD_PASSWORD`) |
+| `QMD_HUB_RESOLVE` | unset | `host:port:IP[,…]` address pinning for Hub requests (testing before DNS) |
 | `QMD_LLAMA_GPU` | `auto` | Force llama.cpp GPU backend (`metal`, `vulkan`, `cuda`) or disable GPU with `false` |
 | `QMD_FORCE_CPU` | unset | Set to `1`/`true` to force CPU mode before any CUDA/Vulkan/Metal probing. Equivalent CLI flag: `--no-gpu`. |
 | `QMD_EMBED_PARALLELISM` | automatic | Override embedding/reranking context parallelism (1-8). Windows CUDA defaults to `1` because parallel CUDA contexts can crash with `ggml-cuda.cu:98`; use Vulkan or raise this only if your driver is stable. |
