@@ -30,6 +30,8 @@ qmd mcp                           # Start MCP server (stdio transport)
 qmd mcp --http [--port N]         # Start MCP server (HTTP, default port 8181)
 qmd mcp --http --daemon           # Start as background daemon
 qmd mcp stop                      # Stop background MCP daemon
+qmd login [--hub <url>]           # Sign in to a QMD Hub (default qmd.svc.plus) via accounts.svc.plus
+qmd whoami / qmd logout [--all]   # Show / clear the saved per-Hub login
 ```
 
 ## Collection Management

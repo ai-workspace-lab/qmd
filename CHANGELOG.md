@@ -4,6 +4,14 @@
 
 ### Changes (ai-workspace-lab fork, rebased onto 2.8.3)
 
+- Hub: **`qmd login` / `qmd logout` / `qmd whoami`** for the official Hub
+  `https://qmd.svc.plus` or any custom-domain Hub, reusing accounts.svc.plus.
+  Interactive (account, hidden password, TOTP when MFA is on) and
+  non-interactive all-at-once (`--email` + `--password-stdin`/`QMD_PASSWORD` +
+  `--mfa-code`/`--totp`/`QMD_MFA_CODE`, exit 3 when MFA is required but no code
+  was given); machine tokens via `--token-stdin`/`--token`/`QMD_HUB_TOKEN`.
+  Per-Hub profiles in `<config dir>/credentials.json` (0600). Baseline:
+  ai-workspace-services/knowledge#400.
 - Context: **two-way sync for every client through xworkmate-bridge**.
   - Read routes (bearer `QMD_INGEST_TOKEN`, paged, max 200 per page):
     `GET /api/v1/agent/catalog`, `/threads`, `/threads/{id}/briefing`,

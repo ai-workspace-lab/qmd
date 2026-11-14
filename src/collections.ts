@@ -51,6 +51,15 @@ export interface CollectionConfig {
   editor_uri_template?: string;               // Alias for editor_uri
   collections: Record<string, Collection>;    // Collection name -> config
   models?: ModelsConfig;
+  hub?: HubConfig;                            // QMD Hub for `qmd login` (Hub-Spoke / L4)
+}
+
+/**
+ * QMD Hub defaults for `qmd login` / `qmd whoami` (overridden by --hub / QMD_HUB_URL).
+ */
+export interface HubConfig {
+  url?: string;           // e.g. https://qmd.svc.plus or a custom-domain Hub
+  accounts_url?: string;  // unified account service (default https://accounts.svc.plus)
 }
 
 /**
